@@ -69,11 +69,7 @@ If starting from an Insta360 `.insv` file:
 python converter.py input/60Hz.insv
 ```
 
-This writes `data/base/60Hz.rrd`. Move or copy it to `logs/base/` if you want to follow the existing layout:
-
-```bash
-mkdir -p logs/base
-cp data/base/60Hz.rrd logs/base/60Hz.rrd
+This writes `data/base/60Hz.rrd`. 
 ```
 
 ## Quick start

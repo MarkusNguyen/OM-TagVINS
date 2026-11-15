@@ -16,7 +16,7 @@ import rerun as rr
 MAGIC = b"8db42d694ccc418790edff439fe026bf"
 JPEG = cv2.IMWRITE_JPEG_QUALITY
 QUALITY = 90
-OUTPUT_DIR = Path(__file__).resolve().parent / "data" / "base"
+OUTPUT_DIR = Path(__file__).resolve().parent / "logs" / "base"
 
 
 def varint(buf, pos):
