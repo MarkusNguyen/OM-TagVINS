@@ -19,12 +19,15 @@ DEFAULT_RUN_CONFIG = {
     },
     "optimizer": {
         "max_iters": 40,
-        "anchor_sigma_px": 0.05,
+        "anchor_sigma_px": 0.5,
         "klt_sigma_px": 0.40,
         "anchor_huber_px": 10.0,
         "klt_huber_px": 2.5,
         "init_prior_rot": 0.0,
         "init_prior_trans": 0.0,
+        # Inflate KLT sigma/Huber by (1 + scale * ||omega|| [rad/s]) during
+        # fast rotation to reduce motion-blur / high-rate coupling influence.
+        "klt_omega_rate_scale": 0.5,
     },
 }
 

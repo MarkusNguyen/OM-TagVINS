@@ -1,0 +1,8 @@
+# Camera pose expressed in the TCP frame (camera-in-TCP).
+# trajectory.py inverts this to obtain T_cam_tcp and applies it to the
+# VIO camera poses: T_world_tcp = T_world_cam1 @ T_cam_tcp.
+T_tcp_cam:
+  - [0.0097, -0.6969, 0.7171, -0.0716]
+  - [-0.9986, -0.0438, -0.0290, 0.0206]
+  - [0.0517, -0.7158, -0.6964, 0.0475]
+  - [0.0, 0.0, 0.0, 1.0]

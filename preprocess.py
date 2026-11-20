@@ -6,6 +6,13 @@ import numpy as np
 import rerun as rr
 
 
+# The gyro stream in the .rrd uses the opposite sign convention from the
+# right-hand body-frame angular velocity expected by so3_exp() in
+# src/gyro.py and src/imu_preintegration.py. Negate it once here so bias
+# estimation, gyro-aided tracking and IMU preintegration all agree.
+GYRO_SIGN = -1.0
+
+
 def load_calibration(yaml_path: str, actual_wh: tuple[int, int]) -> tuple[dict, dict]:
     """
     Loads calib.yaml and automatically scales focal length & principal point
@@ -46,7 +53,19 @@ def load_calibration(yaml_path: str, actual_wh: tuple[int, int]) -> tuple[dict, 
             "T_imu_cam": np.linalg.inv(T_cam_imu),  # Body-from-camera for GTSAM
         }
 
-    return cams, cfg["imu0"]
+    imu_cfg = dict(cfg["imu0"])
+    # Optional fixed gyro scale/misalignment correction:
+    #   omega_corrected = C_g @ (omega_raw - b_g)
+    if "gyro_correction" in imu_cfg:
+        Cg = np.array(imu_cfg["gyro_correction"], dtype=np.float64).reshape(3, 3)
+    else:
+        scale = np.array(imu_cfg.get("gyro_scale", [1.0, 1.0, 1.0]), dtype=np.float64)
+        Cg = np.diag(scale)
+        if "gyro_misalignment" in imu_cfg:
+            Cg = Cg @ np.array(imu_cfg["gyro_misalignment"], dtype=np.float64).reshape(3, 3)
+    imu_cfg["gyro_correction"] = Cg
+
+    return cams, imu_cfg
 
 
 def _unwrap_image_cell(cell):
@@ -183,7 +202,7 @@ def load_base_rrd(rrd_path: str, timeline: str = "time") -> dict:
             return vals.to_numpy(dtype=np.float64)
 
         accel_raw = np.column_stack([_col("/imu/accel/x"), _col("/imu/accel/y"), _col("/imu/accel/z")])
-        gyro_raw  = np.column_stack([_col("/imu/gyro/x"),  _col("/imu/gyro/y"),  _col("/imu/gyro/z")])
+        gyro_raw  = GYRO_SIGN * np.column_stack([_col("/imu/gyro/x"),  _col("/imu/gyro/y"),  _col("/imu/gyro/z")])
 
         # 2. Query the rear camera stream only.
         cam_df = (
@@ -336,7 +355,7 @@ def prepare_vio_inputs(rrd_path: str, yaml_path: str, timeline: str = "time") ->
     # Static initialization uses the rear-camera timeline too. The VIO itself
     # is rear-only, so do not introduce a front-camera (cam0) time shift here.
     t_first_frame = raw["t_cam_raw"][0] + cams["cam1"]["timeshift"]
-    b_gyro_0, _ = initialize_static_imu(
+    b_gyro_0, R_I_G_0 = initialize_static_imu(
         raw["t_imu"], accel_ms2, raw["gyro_raw"], t_first_frame=t_first_frame
     )
 
@@ -349,5 +368,6 @@ def prepare_vio_inputs(rrd_path: str, yaml_path: str, timeline: str = "time") ->
         "t_cam1": t_cam1,
         "rear_imgs": raw["rear_imgs"],
         "b_gyro_0": b_gyro_0,
+        "R_I_G_0": R_I_G_0,
         "imu_intervals_cam1": imu_intervals_cam1,
     }

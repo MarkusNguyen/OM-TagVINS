@@ -17,11 +17,27 @@ Only the rear camera (`cam1`) is used for VIO. The front camera is not used.
 .
 ├── converter.py          # Optional: convert Insta360 .insv to a Rerun .rrd
 ├── preprocess.py         # Load and synchronize camera/IMU data
-├── frontend.py           # AprilTag detection, PnP, KLT tracking, triangulation
-├── optimize.py           # Batch VIO optimizer and main CLI
-├── settings.py           # YAML configuration loader
+├── trajectory.py         # CLI entry point: runs VIO and writes the TCP trajectory
+├── frontend.py           # Front-end entry point: wires together the src/ helpers
+├── optimize.py           # VIO entry point: wires together the src/ helpers
+├── src/                  # Focused implementation modules (see "Source modules" below)
+│   ├── constants.py
+│   ├── lie_algebra.py
+│   ├── camera_model.py
+│   ├── gyro.py
+│   ├── apriltag.py
+│   ├── masking.py
+│   ├── ransac.py
+│   ├── klt_tracker.py
+│   ├── triangulation.py
+│   ├── imu_preintegration.py
+│   ├── vio_initialization.py
+│   ├── vio_solver.py
+│   └── rerun_logger.py
 ├── config/
+│   ├── settings.py       # YAML configuration loader
 │   ├── cam-imu.yaml      # Camera intrinsics, extrinsics, timeshifts, IMU noise
+│   ├── cam-in-tcp.yaml   # Camera-to-TCP extrinsics for trajectory.py
 │   ├── vio.yaml          # Runtime VIO parameters
 │   └── anchor-tags.yaml  # Single-tag anchor reference
 ├── input/                # Source recordings
@@ -31,6 +47,36 @@ Only the rear camera (`cam1`) is used for VIO. The front camera is not used.
 ```
 
 Run all commands from the repository root.
+
+## Source modules (`src/`)
+
+The implementation is split into small, focused modules under `src/`. The top-level
+`frontend.py` and `optimize.py` are import-only entry points: they contain no CLI
+parser and are not run directly. They import these modules and expose
+`run_frontend()` and `run_vio()` respectively. Modules in `src/` never import
+`frontend.py` or `optimize.py`, so the dependency direction is one-way and each
+module can be edited independently.
+
+| Module | Responsibility | Key functions / classes |
+|---|---|---|
+| `src/constants.py` | Shared rear-camera identifiers used by the front-end modules. | `REAR_CAM`, `ACTIVE_CAMS`, `CAMERA_IMAGE_KEYS` |
+| `src/lie_algebra.py` | SO(3) math: rotation logarithm/exponential and right Jacobians used by the IMU preintegrator and solver. | `skew`, `so3_exp`, `so3_log`, `so3_right_jacobian`, `so3_inv_right_jacobian` |
+| `src/camera_model.py` | Kannala-Brandt fisheye model: forward projection, inverse unprojection to unit bearing rays, and the analytical projection Jacobian. | `project_kannala_brandt`, `unproject_kannala_brandt`, `project_kb_with_jacobian` |
+| `src/gyro.py` | Integrates 1000 Hz gyro samples between frames and converts the IMU relative rotation into a camera-frame rotation. | `integrate_gyro_rotation`, `compute_camera_relative_rotation` |
+| `src/apriltag.py` | Anchor tag geometry, IPPE fisheye pose solving with branch continuity, and sub-pixel corner refinement in a virtual pinhole image. | `get_tag_corners_3d`, `solve_tag_pose_fisheye`, `refine_tag_corners_virtual_pinhole` |
+| `src/masking.py` | Builds the fisheye aperture mask and blocks static foreground regions (gripper / operator body). | `build_static_masks` |
+| `src/ransac.py` | Gyro-aided 2-point epipolar test that rejects dynamic outliers and features rigidly carried by the camera. | `ransac_2pt_gyro_epipolar` |
+| `src/klt_tracker.py` | IMU-aided fisheye KLT tracker: gyro-predicted initial flow, forward/backward check, outlier rejection, and new-feature replenishment. | `IMUAidedFisheyeKLTTracker` |
+| `src/triangulation.py` | Linear DLT triangulation directly on bearing rays, plus reprojection/parallax filtering to seed initial 3D landmarks. | `triangulate_bearing_rays`, `triangulate_klt_tracks` |
+| `src/imu_preintegration.py` | On-manifold IMU preintegration with 9×9 covariance and first-order bias Jacobians for fast bias updates. | `PreintegratedIMUFactor` |
+| `src/vio_initialization.py` | Seeds per-frame poses/velocities/biases, landmark positions, and gravity orientation from PnP + IMU data. | `initialize_vio_states`, `extract_frame_gyros`, `pack_visual_observations` |
+| `src/vio_solver.py` | Sparse Levenberg-Marquardt batch optimizer: IMU, anchor, KLT, bias-prior and gravity factors, Huber IRLS weighting, and the final result arrays. | `huber_irls_weights`, `evaluate_visual_residuals_and_jacobians`, `run_batch_vio_optimization` |
+| `src/rerun_logger.py` | Writes the optimized rear-camera trajectory to a Rerun `.rrd`. | `log_optimized_vio_to_rerun` |
+
+If you want to change how a specific part of the pipeline behaves, edit the
+corresponding module rather than the entry points — for example, tag detection
+in `src/apriltag.py`, feature tracking in `src/klt_tracker.py`, or factor weights
+and optimizer convergence in `src/vio_solver.py`.
 
 ## Requirements
 
@@ -74,31 +120,49 @@ This writes `logs/base/60Hz.rrd`.
 
 ## Quick start
 
-Run the complete VIO pipeline:
+The command-line entry point is `trajectory.py`. It runs VIO through
+`optimize.run_vio()` and converts the resulting camera trajectory to a TCP
+trajectory:
 
 ```bash
-python optimize.py --rrd logs/base/60Hz.rrd
+python trajectory.py --rrd logs/base/60Hz.rrd
 ```
 
-`--rrd` is required. Defaults for the calibration, anchor, front-end, and optimizer come from `config/vio.yaml`.
+With `--rrd`, VIO runs first. With `--npz`, an existing camera trajectory is
+read instead and only the TCP transform is applied. With neither flag, the
+newest `*_trajectory.npz` in `logs/estimate/` is used. Defaults for the
+calibration, anchor, front-end, and optimizer come from `config/vio.yaml`.
 
 Outputs are named from the input recording stem:
 
 ```text
-logs/estimate/60Hz_trajectory.npz
-logs/estimate/60Hz_vio.rrd
+logs/estimate/60Hz_tcp_trajectory.npz
+logs/estimate/60Hz_tcp_vio.rrd
 ```
 
-Open the trajectory in Rerun:
+The `.npz` contains `t_tcp`, `T_world_tcp`, `T_tcp0_tcp`, `T_world_cam1`,
+`T_cam_tcp`, and `T_tcp_cam`. Open the Rerun recording with:
 
 ```bash
-rerun logs/estimate/60Hz_vio.rrd
+rerun logs/estimate/60Hz_tcp_vio.rrd
 ```
 
-The output `.rrd` contains only:
+The `.rrd` contains:
 
 ```text
-/world/cam1_rear_trajectory
+world/tcp_trajectory    # static line strip
+world/tcp_marker        # moving marker, logged on the "time" timeline
+```
+
+Use `--no-viz` to skip writing the `.rrd`.
+
+The VIO stage can also be used directly as a library (there is no CLI parser in
+`optimize.py` or `frontend.py`):
+
+```python
+from optimize import run_vio
+
+result = run_vio("logs/base/60Hz.rrd")   # returns T_world_cam1, T_world_imu, ...
 ```
 
 ## Configuration
@@ -116,7 +180,7 @@ frontend:
 
 optimizer:
   max_iters: 40
-  anchor_sigma_px: 0.05
+  anchor_sigma_px: 0.5
   klt_sigma_px: 0.40
   anchor_huber_px: 10.0
   klt_huber_px: 2.5
@@ -129,7 +193,7 @@ optimizer:
 | Key | Meaning | Default |
 |---|---|---:|
 | `max_iters` | Maximum Levenberg-Marquardt iterations | `40` |
-| `anchor_sigma_px` | Anchor corner reprojection noise sigma | `0.05` |
+| `anchor_sigma_px` | Anchor corner reprojection noise sigma | `0.5` |
 | `klt_sigma_px` | KLT reprojection noise sigma | `0.40` |
 | `anchor_huber_px` | Huber threshold for anchor residuals | `10.0` |
 | `klt_huber_px` | Huber threshold for KLT residuals | `2.5` |
@@ -138,19 +202,18 @@ optimizer:
 
 ### Anchor branch selection
 
-The AprilTag pose can have two planar-PnP branches. The optimizer uses the anchor observations to select the branch:
+The AprilTag pose can have two planar-PnP branches. Anchor corner noise and weighting affect how strongly the optimizer follows the initialized branch versus smoothing observations:
 
-- `anchor_sigma_px: 0.05` — tight anchor constraint, keeps the continuity-selected low-motion branch
-- `anchor_sigma_px: 0.30` — looser anchor constraint, allows the high-motion branch
-
-The default configuration uses the validated low-motion branch.
+- `anchor_sigma_px: 0.5` (default) — realistic corner-measurement noise; balances tag constraints with IMU smoothing
+- `anchor_sigma_px: 0.05` — very tight anchor constraint (can overfit corner noise and destabilize/couple the solution)
+- `init_prior_rot` / `init_prior_trans` — optional priors to keep poses near the continuity-selected PnP initialization
 
 ### Command-line overrides
 
 Any value from `config/vio.yaml` can be overridden on the command line:
 
 ```bash
-python optimize.py \
+python trajectory.py \
   --rrd logs/base/60Hz.rrd \
   --anchor-sigma 0.30 \
   --max-iters 50
@@ -159,15 +222,15 @@ python optimize.py \
 Use a different YAML file:
 
 ```bash
-python optimize.py \
+python trajectory.py \
   --rrd logs/base/60Hz.rrd \
-  --config path/to/other.yaml
+  --vio-config path/to/other.yaml
 ```
 
 Set custom output paths:
 
 ```bash
-python optimize.py \
+python trajectory.py \
   --rrd logs/base/60Hz.rrd \
   --out-npz logs/estimate/custom.npz \
   --viz logs/estimate/custom.rrd
@@ -189,6 +252,9 @@ Although both cameras are present in the file, the VIO pipeline uses `cam1` only
 `config/anchor-tags.yaml` documents the single anchor tag, but runtime anchor values come from `config/vio.yaml` or `--anchor-id` / `--anchor-size`.
 
 ## Pipeline details
+
+The entry points below delegate the actual work to the modules listed in
+[Source modules](#source-modules-src).
 
 ### 1. Preprocessing
 
@@ -251,17 +317,22 @@ positions = poses[:, :3, 3]
 
 ## Front-end only
 
-To inspect front-end measurements without running the optimizer:
+`frontend.py` is an import-only module, so call `run_frontend()` to inspect
+front-end measurements without running the optimizer:
 
-```bash
-python frontend.py --rrd logs/base/60Hz.rrd
+```python
+from frontend import run_frontend
+
+visual_meas = run_frontend("logs/base/60Hz.rrd")
 ```
 
-This prints frame count, anchor observation count, initial PnP pose count, and triangulated KLT landmark count.
+This prints the frame count, anchor observation count, initial PnP pose count,
+and triangulated KLT landmark count, and returns the `anchor_obs`,
+`init_poses_world_imu`, `klt_tracks`, and `landmarks_world` arrays.
 
 ## Troubleshooting
 
-- **Missing `--rrd`**: the main CLI requires `--rrd`; there is no default recording path.
+- **No input specified**: `trajectory.py` needs `--rrd`, `--npz`, or an existing `*_trajectory.npz` in `logs/estimate/`. It does not use a default recording path.
 - **Missing camera or IMU entities**: confirm the `.rrd` contains `/camera/rear` and all six `/imu/...` scalar streams.
 - **Static initialization fails**: the recording needs enough stationary IMU samples before the first rear-camera frame.
 - **IMU coverage error**: the IMU stream must cover the full shifted rear-camera time range.

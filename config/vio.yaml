@@ -13,14 +13,19 @@ frontend:
 optimizer:
   max_iters: 20
 
-  # Anchor corner reprojection noise. 0.05 keeps the continuity-selected
-  # low-motion PnP branch; 0.30 selects the high-motion branch.
-  anchor_sigma_px: 0.05
+  # Anchor corner reprojection noise (pixels). Must reflect measurement
+  # uncertainty; overly tight values overfit corner jitter and can induce
+  # rotation-to-translation coupling / solver instability.
+  anchor_sigma_px: 0.5
   klt_sigma_px: 0.40
 
   # Huber thresholds for the anchor and KLT residuals.
   anchor_huber_px: 10.0
   klt_huber_px: 2.5
+
+  # Inflate KLT sigma/Huber by (1 + scale * ||omega|| [rad/s]) to
+  # downweight motion-blurred / high-angular-rate KLT observations.
+  klt_omega_rate_scale: 0.5
 
   # Optional PnP branch-continuity prior; 0 disables each prior.
   init_prior_rot: 0.0
