@@ -219,8 +219,11 @@ def run_batch_vio_optimization(
 
     imu_cfg = vio_data.get("imu_cfg", {})
     g_mag = float(imu_cfg.get("g", imu_cfg.get("gravity_magnitude", 9.80665)))
-    sigma_g = float(imu_cfg.get("gyro_noise_density", imu_cfg.get("gyroscope_noise_density", 1.8e-4))) * np.sqrt(1000.0)
-    sigma_a = float(imu_cfg.get("accel_noise_density", imu_cfg.get("accelerometer_noise_density", 2.0e-3))) * np.sqrt(1000.0)
+    # imu_preintegration.PreintegratedIMUFactor expects continuous-time noise
+    # densities and forms the per-sample covariance as sigma**2 / dt itself.
+    # Passing per-sample std here would inflate the variance by another 1000x.
+    sigma_g = float(imu_cfg.get("gyro_noise_density", imu_cfg.get("gyroscope_noise_density", 1.8e-4)))
+    sigma_a = float(imu_cfg.get("accel_noise_density", imu_cfg.get("accelerometer_noise_density", 2.0e-3)))
     sigma_bg_rw = float(imu_cfg.get("gyro_random_walk", imu_cfg.get("gyroscope_random_walk", 2.0e-5)))
     sigma_ba_rw = float(imu_cfg.get("accel_random_walk", imu_cfg.get("accelerometer_random_walk", 3.0e-4)))
     gyro_correction = np.asarray(
@@ -476,6 +479,30 @@ def run_batch_vio_optimization(
             if not np.all(np.isfinite(dx)):
                 lam *= 10.0
                 continue
+
+            # The stiff IMU term makes the normal equations badly scaled across
+            # pose, landmark, and bias blocks.  Cap each block per iteration so
+            # a single LM step cannot throw landmarks kilometres away before the
+            # cost check sees the damage.
+            dx = np.asarray(dx, dtype=np.float64).copy()
+            for k in range(N):
+                for off, limit in ((0, 0.2), (3, 1.0), (6, 5.0), (9, 0.5), (12, 2.0)):
+                    block = dx[15 * k + off : 15 * k + off + 3]
+                    norm = float(np.linalg.norm(block))
+                    if norm > limit:
+                        block *= limit / norm
+            if M > 0:
+                lm_block = dx[n_state_vars:grav_col_offset].reshape(M, 3)
+                norms = np.linalg.norm(lm_block, axis=1)
+                bad = norms > 5.0
+                if np.any(bad):
+                    lm_block[bad] *= (5.0 / norms[bad])[:, None]
+            dg_block = dx[grav_col_offset : grav_col_offset + 2]
+            dg_norm = float(np.linalg.norm(dg_block))
+            if dg_norm > 0.5:
+                dg_block *= 0.5 / dg_norm
+            if estimate_time_offset and abs(float(dx[td_col])) > 0.01:
+                dx[td_col] = np.sign(dx[td_col]) * 0.01
 
             R_try, p_try, v_try, bg_try, ba_try, lm_try, Rg_try, td_try = apply_update(
                 R_wi, p_wi, v_w, bg, ba, landmarks, R_g, td, dx

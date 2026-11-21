@@ -1,44 +1,12 @@
-# Rear-camera VIO run configuration.
-# Command-line flags override the values in this file.
-
-anchor:
-  # Stationary tag36h11 anchor
-  id: 0
-  size_m: 0.100
-
 frontend:
   max_corners_per_cam: 220
   min_track_len: 5
-  # Minimum pairwise bearing parallax for KLT triangulation. During
-  # rotation-dominant motion, large thresholds reject nearly all tracks.
-  min_parallax_deg: 0.15
+  min_parallax_deg: 1.0
 
 optimizer:
-  max_iters: 20
-
-  # Anchor corner reprojection noise (pixels). Must reflect measurement
-  # uncertainty; overly tight values overfit corner jitter and can induce
-  # rotation-to-translation coupling / solver instability.
+  max_iters: 25
   anchor_sigma_px: 0.05
-  klt_sigma_px: 0.40
-
-  # Huber thresholds for the anchor and KLT residuals.
+  klt_sigma_px: 0.80
   anchor_huber_px: 10.0
   klt_huber_px: 2.5
-
-  # Inflate KLT sigma/Huber by (1 + scale * ||omega|| [rad/s]) to
-  # downweight motion-blurred / high-angular-rate KLT observations.
-  klt_omega_rate_scale: 0.15
-
-  # Rolling-shutter full-frame readout in seconds. null uses the value that
-  # converter.py extracts from the Insta360 .insv telemetry; 0 disables it.
-  rolling_shutter_readout_s: null
-
-  # Online camera-minus-IMU time offset. Positive means camera timestamps lag
-  # the IMU clock. Prior keeps this weakly anchored to the calibration value.
-  estimate_time_offset: true
-  time_offset_prior_s: 0.005
-
-  # Optional PnP branch-continuity prior; 0 disables each prior.
-  init_prior_rot: 0.0
-  init_prior_trans: 0.0
+  klt_omega_rate_scale: 0.60
