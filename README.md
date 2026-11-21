@@ -57,26 +57,28 @@ parser and are not run directly. They import these modules and expose
 `frontend.py` or `optimize.py`, so the dependency direction is one-way and each
 module can be edited independently.
 
+The modules are grouped by responsibility:
+
 | Module | Responsibility | Key functions / classes |
 |---|---|---|
-| `src/constants.py` | Shared rear-camera identifiers used by the front-end modules. | `REAR_CAM`, `ACTIVE_CAMS`, `CAMERA_IMAGE_KEYS` |
-| `src/lie_algebra.py` | SO(3) math: rotation logarithm/exponential and right Jacobians used by the IMU preintegrator and solver. | `skew`, `so3_exp`, `so3_log`, `so3_right_jacobian`, `so3_inv_right_jacobian` |
-| `src/camera_model.py` | Kannala-Brandt fisheye model: forward projection, inverse unprojection to unit bearing rays, and the analytical projection Jacobian. | `project_kannala_brandt`, `unproject_kannala_brandt`, `project_kb_with_jacobian` |
-| `src/gyro.py` | Integrates 1000 Hz gyro samples between frames and converts the IMU relative rotation into a camera-frame rotation. | `integrate_gyro_rotation`, `compute_camera_relative_rotation` |
-| `src/apriltag.py` | Anchor tag geometry, IPPE fisheye pose solving with branch continuity, and sub-pixel corner refinement in a virtual pinhole image. | `get_tag_corners_3d`, `solve_tag_pose_fisheye`, `refine_tag_corners_virtual_pinhole` |
-| `src/masking.py` | Builds the fisheye aperture mask and blocks static foreground regions (gripper / operator body). | `build_static_masks` |
-| `src/ransac.py` | Gyro-aided 2-point epipolar test that rejects dynamic outliers and features rigidly carried by the camera. | `ransac_2pt_gyro_epipolar` |
-| `src/klt_tracker.py` | IMU-aided fisheye KLT tracker: gyro-predicted initial flow, forward/backward check, outlier rejection, and new-feature replenishment. | `IMUAidedFisheyeKLTTracker` |
-| `src/triangulation.py` | Linear DLT triangulation directly on bearing rays, plus reprojection/parallax filtering to seed initial 3D landmarks. | `triangulate_bearing_rays`, `triangulate_klt_tracks` |
-| `src/imu_preintegration.py` | On-manifold IMU preintegration with 9×9 covariance and first-order bias Jacobians for fast bias updates. | `PreintegratedIMUFactor` |
-| `src/vio_initialization.py` | Seeds per-frame poses/velocities/biases, landmark positions, and gravity orientation from PnP + IMU data. | `initialize_vio_states`, `extract_frame_gyros`, `pack_visual_observations` |
-| `src/vio_solver.py` | Sparse Levenberg-Marquardt batch optimizer: IMU, anchor, KLT, bias-prior and gravity factors, Huber IRLS weighting, and the final result arrays. | `huber_irls_weights`, `evaluate_visual_residuals_and_jacobians`, `run_batch_vio_optimization` |
-| `src/rerun_logger.py` | Writes the optimized rear-camera trajectory to a Rerun `.rrd`. | `log_optimized_vio_to_rerun` |
+| `src/core/constants.py` | Shared rear-camera identifiers used by the front-end modules. | `REAR_CAM`, `ACTIVE_CAMS`, `CAMERA_IMAGE_KEYS` |
+| `src/core/lie_algebra.py` | SO(3) math: rotation logarithm/exponential and right Jacobians used by the IMU preintegrator and solver. | `skew`, `so3_exp`, `so3_log`, `so3_right_jacobian`, `so3_inv_right_jacobian` |
+| `src/core/camera_model.py` | Kannala-Brandt fisheye model: forward projection, inverse unprojection to unit bearing rays, and the analytical projection Jacobian. | `project_kannala_brandt`, `unproject_kannala_brandt`, `project_kb_with_jacobian` |
+| `src/frontend/gyro.py` | Integrates 1000 Hz gyro samples, converts IMU relative rotation into camera-frame rotation, and maps rolling-shutter rays back to the nominal frame timestamp. | `integrate_gyro_rotation`, `compute_camera_relative_rotation`, `compensate_rolling_shutter_rays` |
+| `src/frontend/apriltag.py` | Anchor tag geometry, IPPE fisheye pose solving with branch continuity, and sub-pixel corner refinement in a virtual pinhole image. | `get_tag_corners_3d`, `solve_tag_pose_fisheye`, `refine_tag_corners_virtual_pinhole` |
+| `src/frontend/masking.py` | Builds the fisheye aperture mask and blocks static foreground regions (gripper / operator body). | `build_static_masks` |
+| `src/frontend/ransac.py` | Gyro-aided 2-point epipolar test that rejects dynamic outliers while retaining low-parallax static background points. | `ransac_2pt_gyro_epipolar` |
+| `src/frontend/klt_tracker.py` | IMU-aided fisheye KLT tracker: gyro-predicted initial flow, forward/backward check, outlier rejection, and new-feature replenishment. | `IMUAidedFisheyeKLTTracker` |
+| `src/frontend/triangulation.py` | Linear DLT triangulation directly on bearing rays, plus reprojection/parallax filtering to seed initial 3D landmarks. | `triangulate_bearing_rays`, `triangulate_klt_tracks` |
+| `src/backend/imu_preintegration.py` | On-manifold IMU preintegration with 9×9 covariance, gyro/accel corrections, and first-order bias Jacobians. | `PreintegratedIMUFactor` |
+| `src/backend/vio_initialization.py` | Seeds per-frame poses/velocities/biases, landmark positions, and gravity orientation from PnP + IMU data. | `initialize_vio_states`, `refine_initial_velocities`, `extract_frame_gyros`, `pack_visual_observations` |
+| `src/backend/vio_solver.py` | Sparse Levenberg-Marquardt batch optimizer: IMU, anchor, KLT, bias-prior, gravity, and time-offset factors, rolling-shutter compensation, Huber IRLS weighting, and final result arrays. | `huber_irls_weights`, `evaluate_visual_residuals_and_jacobians`, `run_batch_vio_optimization` |
+| `src/viz/rerun_logger.py` | Writes the optimized rear-camera trajectory and per-frame pose axes to a Rerun `.rrd`. | `log_optimized_vio_to_rerun` |
 
 If you want to change how a specific part of the pipeline behaves, edit the
 corresponding module rather than the entry points — for example, tag detection
-in `src/apriltag.py`, feature tracking in `src/klt_tracker.py`, or factor weights
-and optimizer convergence in `src/vio_solver.py`.
+in `src/frontend/apriltag.py`, feature tracking in `src/frontend/klt_tracker.py`,
+or factor weights and optimizer convergence in `src/backend/vio_solver.py`.
 
 ## Requirements
 
@@ -115,7 +117,12 @@ If starting from an Insta360 `.insv` file:
 python converter.py input/60Hz.insv
 ```
 
-This writes `logs/base/60Hz.rrd`. 
+This writes `logs/base/60Hz.rrd`. Conversion uses `telemetry-parser` to read
+`Lens.Data.frame_readout_time` from the `.insv` metadata (the same field used by
+specialist-ai/specialist), converts milliseconds to seconds, and stores it on
+the recording as `/calibration/rolling_shutter_readout_s`. The VIO loader reads
+that entity automatically; an explicit value in `config/vio.yaml` or on the CLI
+overrides it.
 
 
 ## Quick start
@@ -141,18 +148,24 @@ logs/estimate/60Hz_tcp_vio.rrd
 ```
 
 The `.npz` contains `t_tcp`, `T_world_tcp`, `T_tcp0_tcp`, `T_world_cam1`,
-`T_cam_tcp`, and `T_tcp_cam`. Open the Rerun recording with:
+`T_cam_tcp`, and `T_tcp_cam`. The intermediate VIO result also stores
+`td_cam_imu` (estimated camera-minus-IMU offset, seconds) and
+`rolling_shutter_readout_s`. Open the Rerun recording with:
 
 ```bash
 rerun logs/estimate/60Hz_tcp_vio.rrd
 ```
 
-The `.rrd` contains:
+The TCP `.rrd` contains:
 
 ```text
 world/tcp_trajectory    # static line strip
+world/tcp_pose/axes     # per-timestamp pose axes, logged on the "time" timeline
 world/tcp_marker        # moving marker, logged on the "time" timeline
 ```
+
+The VIO `.rrd` written by `optimize.py` additionally contains
+`world/cam1_pose/axes` and `world/cam1_pose/origin` at each camera timestamp.
 
 Use `--no-viz` to skip writing the `.rrd`.
 
@@ -177,35 +190,52 @@ anchor:
 frontend:
   max_corners_per_cam: 220
   min_track_len: 5
+  min_parallax_deg: 0.15
 
 optimizer:
   max_iters: 40
-  anchor_sigma_px: 0.5
+  anchor_sigma_px: 0.10
   klt_sigma_px: 0.40
   anchor_huber_px: 10.0
   klt_huber_px: 2.5
+  klt_omega_rate_scale: 0.15
+  rolling_shutter_readout_s: null
+  estimate_time_offset: true
+  time_offset_prior_s: 0.005
   init_prior_rot: 0.0
   init_prior_trans: 0.0
 ```
+
+### Frontend parameters
+
+| Key | Meaning | Default |
+|---|---|---:|
+| `max_corners_per_cam` | Maximum tracked KLT corners | `220` |
+| `min_track_len` | Minimum KLT track length in frames | `5` |
+| `min_parallax_deg` | Minimum KLT bearing parallax for triangulation | `0.15` |
 
 ### Optimizer parameters
 
 | Key | Meaning | Default |
 |---|---|---:|
 | `max_iters` | Maximum Levenberg-Marquardt iterations | `40` |
-| `anchor_sigma_px` | Anchor corner reprojection noise sigma | `0.5` |
+| `anchor_sigma_px` | Anchor corner reprojection noise sigma | `0.10` |
 | `klt_sigma_px` | KLT reprojection noise sigma | `0.40` |
 | `anchor_huber_px` | Huber threshold for anchor residuals | `10.0` |
 | `klt_huber_px` | Huber threshold for KLT residuals | `2.5` |
+| `klt_omega_rate_scale` | Downweight fast-rotation KLT observations by `1 + scale*||omega||` | `0.15` |
+| `rolling_shutter_readout_s` | Full-frame readout in seconds; `null` uses `.insv` metadata, `0` disables | `null` |
+| `estimate_time_offset` | Estimate camera-minus-IMU time offset as an optimizer variable | `true` |
+| `time_offset_prior_s` | Prior sigma (seconds) on that time offset | `0.005` |
 | `init_prior_rot` | Optional PnP branch-continuity rotation prior; `0` disables | `0.0` |
 | `init_prior_trans` | Optional PnP branch-continuity translation prior; `0` disables | `0.0` |
 
 ### Anchor branch selection
 
-The AprilTag pose can have two planar-PnP branches. Anchor corner noise and weighting affect how strongly the optimizer follows the initialized branch versus smoothing observations:
+The AprilTag pose can have two planar-PnP branches. The frontend keeps only branches whose reprojection error is within 3 px of the best branch, then applies continuity. Anchor corner noise and weighting affect how strongly the optimizer follows the initialized branch versus smoothing observations:
 
-- `anchor_sigma_px: 0.5` (default) — realistic corner-measurement noise; balances tag constraints with IMU smoothing
-- `anchor_sigma_px: 0.05` — very tight anchor constraint (can overfit corner noise and destabilize/couple the solution)
+- `anchor_sigma_px: 0.10` (default) — stronger tag pull; overfitting can couple tag jitter into translation
+- `anchor_sigma_px: 0.5` — looser constraint; smoother but less influenced by the anchor
 - `init_prior_rot` / `init_prior_trans` — optional priors to keep poses near the continuity-selected PnP initialization
 
 ### Command-line overrides
@@ -216,7 +246,11 @@ Any value from `config/vio.yaml` can be overridden on the command line:
 python trajectory.py \
   --rrd logs/base/60Hz.rrd \
   --anchor-sigma 0.30 \
-  --max-iters 50
+  --min-parallax-deg 0.15 \
+  --max-iters 50 \
+  --rolling-shutter-readout-s 0.004 \
+  --time-offset-prior-s 0.005 \
+  --no-estimate-time-offset
 ```
 
 Use a different YAML file:
@@ -245,7 +279,7 @@ The YAML loader rejects unknown keys, so misspelled parameter names fail early.
 - `cam0` and `cam1` intrinsics and distortion coefficients
 - `timeshift_cam_imu` for each camera
 - `T_cam_imu` extrinsics
-- IMU update rate, noise densities, random walks, and gravity magnitude
+- IMU update rate, gyro sign, noise densities, random walks, and gravity magnitude
 
 Although both cameras are present in the file, the VIO pipeline uses `cam1` only. The rear-camera timeshift is applied before static IMU initialization and IMU interval slicing.
 
@@ -303,7 +337,8 @@ The `.npz` trajectory contains:
 | `b_gyro` | `(N, 3)` | Gyro bias |
 | `b_accel` | `(N, 3)` | Accelerometer bias |
 | `landmarks_world` | `(M, 3)` | Optimized 3D landmarks |
-| `gravity_world` | `(3,)` | Estimated gravity vector |
+| `gravity_world` | `(3,)` | Estimated gravity vector, approximately `[0, 0, -9.81]` in the returned frame |
+| `R_gravity_align` | `(3, 3)` | Rotation applied to map the internal tag frame to the returned gravity-aligned frame |
 
 Load it with:
 

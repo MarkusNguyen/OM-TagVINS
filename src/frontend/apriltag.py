@@ -7,7 +7,7 @@ for the pipeline entry points that call these helpers.
 import cv2
 import numpy as np
 
-from .camera_model import (
+from ..core.camera_model import (
     project_kannala_brandt,
     unproject_kannala_brandt,
 )
@@ -78,6 +78,16 @@ def solve_tag_pose_fisheye(
         return None
     if len(candidates) == 1 or prev_T_cam_tag is None:
         return min(candidates, key=lambda item: item[1])[0]
+
+    # A planar tag can produce two IPPE branches. Continuity helps reject the
+    # wrong branch, but it must not override an obviously worse reprojection
+    # fit. Keep only branches whose reprojection error is close to the best one.
+    best_reproj_err = min(float(item[1]) for item in candidates)
+    candidates = [
+        item for item in candidates if float(item[1]) <= best_reproj_err + 3.0
+    ]
+    if len(candidates) == 1:
+        return candidates[0][0]
 
     prev_R = prev_T_cam_tag[:3, :3]
     prev_t = prev_T_cam_tag[:3, 3]

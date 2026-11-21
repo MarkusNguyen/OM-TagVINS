@@ -6,7 +6,7 @@ for the pipeline entry points that call these helpers.
 
 import numpy as np
 
-from .lie_algebra import (
+from ..core.lie_algebra import (
     skew,
     so3_exp,
     so3_inv_right_jacobian,
@@ -21,8 +21,8 @@ class PreintegratedIMUFactor:
     maintaining preintegrated (dR, dv, dp), 9x9 covariance, and first-order
     bias Jacobians for O(1) bias updates during optimization.
 
-    Gyro measurements are corrected with an optional fixed scale/misalignment
-    matrix C_g: omega = C_g @ (omega_raw - b_g).
+    Gyro/accel measurements are corrected with optional fixed scale/misalignment
+    matrices: omega = C_g @ (omega_raw - b_g), a = C_a @ (a_raw - b_a).
     """
 
     def __init__(
@@ -33,6 +33,7 @@ class PreintegratedIMUFactor:
         sigma_g: float,
         sigma_a: float,
         gyro_correction: np.ndarray | None = None,
+        accel_correction: np.ndarray | None = None,
     ):
         self.interval = interval
         self.sigma_g = sigma_g
@@ -41,12 +42,17 @@ class PreintegratedIMUFactor:
             self.gyro_correction = np.eye(3, dtype=np.float64)
         else:
             self.gyro_correction = np.asarray(gyro_correction, dtype=np.float64).reshape(3, 3)
+        if accel_correction is None:
+            self.accel_correction = np.eye(3, dtype=np.float64)
+        else:
+            self.accel_correction = np.asarray(accel_correction, dtype=np.float64).reshape(3, 3)
         self.reintegrate(b_g_bar, b_a_bar)
 
     def reintegrate(self, b_g_bar: np.ndarray, b_a_bar: np.ndarray):
         self.b_g_bar = b_g_bar.copy()
         self.b_a_bar = b_a_bar.copy()
         Cg = self.gyro_correction
+        Ca = self.accel_correction
 
         dts = self.interval["dt"]
         gyros = self.interval["gyro"]
@@ -83,7 +89,7 @@ class PreintegratedIMUFactor:
                 accel_raw = accels[k]
 
             omega = Cg @ (omega_raw - b_g_bar)
-            accel = accel_raw - b_a_bar
+            accel = Ca @ (accel_raw - b_a_bar)
 
             dR_step = so3_exp(omega * dt)
             Jr_step = so3_right_jacobian(omega * dt)
@@ -97,8 +103,8 @@ class PreintegratedIMUFactor:
             ])
             B = np.block([
                 [Jr_step @ Cg * dt, Z3],
-                [Z3, dR * dt],
-                [Z3, 0.5 * dR * (dt * dt)],
+                [Z3, dR @ Ca * dt],
+                [Z3, 0.5 * (dR @ Ca) * (dt * dt)],
             ])
             Q_noise = np.diag([
                 (self.sigma_g ** 2) / dt,
@@ -112,9 +118,9 @@ class PreintegratedIMUFactor:
 
             # Propagate bias Jacobians (before updating dR, dv, dp)
             J_p_bg += J_v_bg * dt - 0.5 * (dR @ a_skew @ J_R_bg) * (dt * dt)
-            J_p_ba += J_v_ba * dt - 0.5 * dR * (dt * dt)
+            J_p_ba += J_v_ba * dt - 0.5 * (dR @ Ca) * (dt * dt)
             J_v_bg += -(dR @ a_skew @ J_R_bg) * dt
-            J_v_ba += -dR * dt
+            J_v_ba += -(dR @ Ca) * dt
             J_R_bg = dR_step.T @ J_R_bg - Jr_step @ Cg * dt
 
             # Propagate nominal preintegrated states

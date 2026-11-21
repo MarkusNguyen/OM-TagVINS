@@ -7,8 +7,8 @@ for the pipeline entry points that call these helpers.
 import cv2
 import numpy as np
 
-from .camera_model import project_kannala_brandt, unproject_kannala_brandt
-from .lie_algebra import so3_log
+from ..core.camera_model import project_kannala_brandt, unproject_kannala_brandt
+from ..core.lie_algebra import so3_log
 from .ransac import ransac_2pt_gyro_epipolar
 
 
@@ -88,7 +88,7 @@ class IMUAidedFisheyeKLTTracker:
                     flags=cv2.OPTFLOW_USE_INITIAL_FLOW,
                 )
                 rot_angle = float(np.linalg.norm(so3_log(dR_c1_c0)))
-                fb_thresh = 1.0 / (1.0 + 5.0 * max(rot_angle, 0.0))
+                fb_thresh = 1.0 / (1.0 + 2.0 * max(rot_angle, 0.0))
             else:
                 p1, st_fwd, _ = cv2.calcOpticalFlowPyrLK(
                     self.prev_gray, gray, p0, None, winSize=(21, 21), maxLevel=3

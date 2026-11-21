@@ -37,12 +37,12 @@ def ransac_2pt_gyro_epipolar(
     c = np.cross(r1, r0_rot)
     c_norms = np.linalg.norm(c, axis=1)
 
-    # When camera translates strongly, points with near-zero parallax are carried rigidly
-    # with the camera/gripper rather than belonging to the static world
-    rigid_with_cam = (med_parallax > 0.010) & (rot_err < 0.18 * med_parallax)
-    valid_sample = (~rigid_with_cam) & (c_norms > 1e-5)
+    # Static far-field points legitimately have small parallax relative to a
+    # pure-rotation prediction when the camera translates. Do not discard them;
+    # the static mask already removes gripper/body points that move with the rig.
+    valid_sample = c_norms > 1e-5
     if np.sum(valid_sample) < 4:
-        return rot_err < (ang_thresh_rad * 2.5)
+        return np.ones(N, dtype=bool)
 
     c_unit = np.zeros_like(c)
     c_unit[valid_sample] = c[valid_sample] / c_norms[valid_sample, None]

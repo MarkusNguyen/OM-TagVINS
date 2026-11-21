@@ -77,7 +77,8 @@ def initialize_vio_states(
         else:
             R_wi[k] = R0
 
-    # Central-difference initial velocities
+    # Central-difference initial velocities, then a linear visual-inertial
+    # refinement that also uses preintegrated IMU deltas.
     for k in range(N):
         if k == 0:
             v_w[k] = (p_wi[1] - p_wi[0]) / max(t_cam1[1] - t_cam1[0], 1e-4)
@@ -85,6 +86,7 @@ def initialize_vio_states(
             v_w[k] = (p_wi[N - 1] - p_wi[N - 2]) / max(t_cam1[N - 1] - t_cam1[N - 2], 1e-4)
         else:
             v_w[k] = (p_wi[k + 1] - p_wi[k - 1]) / max(t_cam1[k + 1] - t_cam1[k - 1], 1e-4)
+    v_w = refine_initial_velocities(t_cam1, R_wi, p_wi, preint_factors, g_world, v_w)
 
     # Pack static 3D landmarks into contiguous array
     lm_dict = visual_meas["landmarks_world"]["cam1"]
@@ -93,6 +95,61 @@ def initialize_vio_states(
     landmarks = np.array([lm_dict[tid] for tid in lm_ids], dtype=np.float64) if lm_ids else np.zeros((0, 3))
 
     return R_wi, p_wi, v_w, bg, ba, landmarks, tid_to_lm_idx, R_g
+
+
+def refine_initial_velocities(
+    t_cam1: np.ndarray,
+    R_wi: np.ndarray,
+    p_wi: np.ndarray,
+    preint_factors: list[PreintegratedIMUFactor],
+    g_world: np.ndarray,
+    v_init: np.ndarray,
+) -> np.ndarray:
+    """Linear VI alignment of initial frame velocities.
+
+    Uses preintegrated position/velocity deltas together with the PnP pose graph:
+        p_j - p_i - 0.5*g*dt^2 - R_i*dp = v_i*dt
+        v_j - v_i = g*dt + R_i*dv
+    A weak finite-difference prior keeps the least-squares system well posed.
+    """
+    N = len(t_cam1)
+    if N < 2 or len(preint_factors) < N - 1:
+        return v_init.copy()
+
+    I3 = np.eye(3, dtype=np.float64)
+    rows, rhs = [], []
+
+    def frame_row(k: int, value: np.ndarray) -> np.ndarray:
+        row = np.zeros((3, 3 * N), dtype=np.float64)
+        row[:, 3 * k : 3 * k + 3] = value
+        return row
+
+    for k in range(N - 1):
+        pf = preint_factors[k]
+        dt = max(float(pf.dt), 1e-4)
+        Rk = R_wi[k]
+
+        b_pos = (
+            p_wi[k + 1] - p_wi[k] - 0.5 * g_world * (dt * dt) - Rk @ pf.dp
+        ) / dt
+        rows.append(frame_row(k, I3))
+        rhs.append(b_pos)
+
+        row = np.zeros((3, 3 * N), dtype=np.float64)
+        row[:, 3 * k : 3 * k + 3] = -I3
+        row[:, 3 * (k + 1) : 3 * (k + 1) + 3] = I3
+        rows.append(row)
+        rhs.append(g_world * dt + Rk @ pf.dv)
+
+    # Weak prior towards central differences (guards against degenerate motion).
+    for k in range(N):
+        rows.append(frame_row(k, 0.1 * I3))
+        rhs.append(0.1 * v_init[k])
+
+    A = np.vstack(rows)
+    b = np.concatenate(rhs)
+    v_sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+    return v_sol.reshape(N, 3)
 
 
 def extract_frame_gyros(vio_data: dict) -> np.ndarray:

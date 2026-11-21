@@ -10,9 +10,9 @@ import numpy as np
 from scipy.sparse import coo_matrix
 from scipy.sparse.linalg import spsolve
 
-from .camera_model import project_kb_with_jacobian
+from ..core.camera_model import project_kb_with_jacobian
+from ..core.lie_algebra import so3_exp, so3_inv_right_jacobian, so3_log
 from .imu_preintegration import PreintegratedIMUFactor
-from .lie_algebra import so3_exp, so3_inv_right_jacobian, so3_log
 from .vio_initialization import (
     extract_frame_gyros,
     initialize_vio_states,
@@ -50,14 +50,21 @@ def evaluate_visual_residuals_and_jacobians(
 ):
     """
     Vectorized evaluation of fisheye reprojection residuals and analytical
-    Jacobians on the rear-camera timeline. The optional dt_offset term is zero
-    for this rear-only pipeline.
+    Jacobians on the rear-camera timeline.
+
+    ``dt_offset`` is the current camera-minus-IMU timing estimate. Each row of
+    the image applies a rolling-shutter correction using the sensor readout
+    stored in ``cam1['rolling_shutter_readout_s']`` (seconds):
+        dt_eff = dt_offset + (v - h/2)/h * readout_s
+    so the frame timestamp is treated as the center-row exposure time.
 
     Gyro measurements are corrected with optional fixed scale/misalignment
     C_g: omega_unb = C_g @ (omega_raw - b_g). When omega_rate_scale > 0,
     per-observation sigma and Huber threshold are inflated by
     (1 + omega_rate_scale * ||omega_unb||) to downweight motion-blurred /
     high-angular-rate measurements.
+
+    Returns (residual, pixel_error, J_state, J_point, J_time_offset).
     """
     K = len(frame_idx)
     if K == 0:
@@ -66,6 +73,7 @@ def evaluate_visual_residuals_and_jacobians(
             np.empty((0, 2)),
             np.empty((0, 2, 15)),
             np.empty((0, 2, 3)),
+            np.empty((0, 2)),
         )
 
     R_k = R_wi[frame_idx]          # (K, 3, 3)
@@ -87,13 +95,21 @@ def evaluate_visual_residuals_and_jacobians(
         Cg = np.asarray(gyro_correction, dtype=np.float64).reshape(3, 3)
         omega_unb = (Cg @ omega_unb_raw.T).T
 
-    # Optional camera time-offset compensation (dt_offset = 0 for rear-only).
-    R_off = np.array([so3_exp(om * dt_offset) for om in omega_unb], dtype=np.float64)
+    # Camera/IMU time offset plus per-row rolling-shutter exposure shift.
+    # Frame timestamps are assumed to represent center-row exposure.
+    h_px = float(cam1["resolution"][1])
+    readout = float(cam1.get("rolling_shutter_readout_s") or 0.0)
+    row_fraction = (uv_meas[:, 1] - 0.5 * h_px) / h_px
+    dt_eff = float(dt_offset) + row_fraction * max(readout, 0.0)  # (K,)
+
+    R_off = np.array(
+        [so3_exp(om * dt) for om, dt in zip(omega_unb, dt_eff)], dtype=np.float64
+    )
     R_off_T = np.transpose(R_off, (0, 2, 1))
     v_I = np.einsum("kij,kj->ki", R_k_T, v_k)
 
     X_I_rot = np.einsum("kij,kj->ki", R_off_T, X_I)
-    X_I_off = X_I_rot - dt_offset * v_I
+    X_I_off = X_I_rot - dt_eff[:, None] * v_I
 
     R_ci = cam1["T_cam_imu"][:3, :3]
     t_ci = cam1["T_cam_imu"][:3, 3]
@@ -135,30 +151,39 @@ def evaluate_visual_residuals_and_jacobians(
     S_XI_rot = batch_skew(X_I_rot)
 
     J_state = np.zeros((K, 2, 15), dtype=np.float64)
-    # d(X_I_off)/d(dphi_k) = R_off^T [X_I]_x - dt_offset [v_I]_x
-    dX_dphi = np.einsum("kij,kjl->kil", R_off_T, S_XI) - dt_offset * S_vI
+    # d(X_I_off)/d(dphi_k) = R_off^T [X_I]_x - dt_eff [v_I]_x
+    dX_dphi = np.einsum("kij,kjl->kil", R_off_T, S_XI) - dt_eff[:, None, None] * S_vI
     J_state[:, :, 0:3] = np.einsum("kij,kjl->kil", J_XI_off, dX_dphi)
 
     # d(X_I_off)/d(dp_k) = -R_off^T R_k^T
     dX_dp = -np.einsum("kij,kjl->kil", R_off_T, R_k_T)
     J_state[:, :, 3:6] = np.einsum("kij,kjl->kil", J_XI_off, dX_dp)
 
-    # d(X_I_off)/d(dv_k) = -dt_offset * R_k^T
-    J_state[:, :, 6:9] = np.einsum("kij,kjl->kil", J_XI_off, -dt_offset * R_k_T)
+    # d(X_I_off)/d(dv_k) = -dt_eff * R_k^T
+    J_state[:, :, 6:9] = np.einsum(
+        "kij,kjl->kil", J_XI_off, -dt_eff[:, None, None] * R_k_T
+    )
 
-    # d(X_I_off)/d(dbg_k) = -dt_offset * [R_off^T X_I]_x @ C_g
+    # d(X_I_off)/d(dbg_k) = -dt_eff * [R_off^T X_I]_x @ C_g
     J_state[:, :, 9:12] = np.einsum(
-        "kij,kjl,lm->kim", J_XI_off, -dt_offset * S_XI_rot, Cg
+        "kij,kjl,lm->kim", J_XI_off, -dt_eff[:, None, None] * S_XI_rot, Cg
     )
 
     # d(uv)/d(X_world) = -d(uv)/d(dp_k)
     J_pt = -J_state[:, :, 3:6]
 
+    # Derivative w.r.t. the global camera-minus-IMU time offset. The
+    # rolling-shutter row term is constant, so d(dt_eff)/d(td) = 1.
+    # d(R^T X)/dt = R^T [X]_x omega; d(-dt*v)/dt = -v.
+    dX_dtd = np.einsum("kij,kjl,kl->ki", R_off_T, S_XI, omega_unb) - v_I
+    J_td = np.einsum("kij,kj->ki", J_XI_off, dX_dtd)
+
     res_weighted = (err_px * scale).ravel()
     J_state *= scale[:, :, None]
     J_pt *= scale[:, :, None]
+    J_td *= scale[:, 0][:, None]
 
-    return res_weighted, err_px, J_state, J_pt
+    return res_weighted, err_px, J_state, J_pt, J_td
 
 
 def run_batch_vio_optimization(
@@ -172,10 +197,13 @@ def run_batch_vio_optimization(
     init_prior_rot: float = 0.0,
     init_prior_trans: float = 0.0,
     klt_omega_rate_scale: float = 0.0,
+    estimate_time_offset: bool = True,
+    time_offset_prior_s: float = 0.005,
 ) -> dict:
     """
     Runs full-batch on-manifold Levenberg-Marquardt VIO bundle adjustment over all
-    frames (656 IMU poses/velocities/biases), 3D KLT landmarks, and 2-DoF gravity tilt.
+    frames (IMU poses/velocities/biases), 3D KLT landmarks, 2-DoF gravity tilt,
+    and (optionally) the camera-minus-IMU time offset.
 
     Anchor corners use anchor_sigma_px/anchor_huber_delta_px; KLT uses
     klt_sigma_px/huber_delta_px. When klt_omega_rate_scale > 0, KLT sigma and
@@ -185,7 +213,9 @@ def run_batch_vio_optimization(
     N = len(vio_data["t_cam1"])
     cam1 = vio_data["cams"]["cam1"]
     # Rear camera is the only/master camera; observations are already on t_cam1.
-    dt_offset = 0.0
+    # td is the camera-minus-IMU timing offset, estimated as an extra variable.
+    td = 0.0
+    TD_MAX = 0.02
 
     imu_cfg = vio_data.get("imu_cfg", {})
     g_mag = float(imu_cfg.get("g", imu_cfg.get("gravity_magnitude", 9.80665)))
@@ -196,6 +226,9 @@ def run_batch_vio_optimization(
     gyro_correction = np.asarray(
         imu_cfg.get("gyro_correction", np.eye(3, dtype=np.float64)), dtype=np.float64
     ).reshape(3, 3)
+    accel_correction = np.asarray(
+        imu_cfg.get("accel_correction", np.eye(3, dtype=np.float64)), dtype=np.float64
+    ).reshape(3, 3)
 
     # 1. Preintegrate all 1000 Hz IMU intervals
     b_gyro_0 = np.asarray(vio_data["b_gyro_0"], dtype=np.float64)
@@ -204,6 +237,7 @@ def run_batch_vio_optimization(
             iv, b_gyro_0, np.zeros(3),
             sigma_g=sigma_g, sigma_a=sigma_a,
             gyro_correction=gyro_correction,
+            accel_correction=accel_correction,
         )
         for iv in vio_data["imu_intervals_cam1"]
     ]
@@ -231,9 +265,10 @@ def run_batch_vio_optimization(
     n_state_vars = 15 * N
     n_lm_vars = 3 * M
     grav_col_offset = n_state_vars + n_lm_vars
-    total_vars = grav_col_offset + 2
+    td_col = grav_col_offset + 2 if estimate_time_offset else None
+    total_vars = grav_col_offset + 2 + (1 if estimate_time_offset else 0)
 
-    def build_system(R_cur, p_cur, v_cur, bg_cur, ba_cur, lm_cur, Rg_cur):
+    def build_system(R_cur, p_cur, v_cur, bg_cur, ba_cur, lm_cur, Rg_cur, td_cur):
         g_world = Rg_cur @ np.array([0.0, 0.0, -g_mag], dtype=np.float64)
         G_basis = Rg_cur @ np.array(
             [[0.0, -g_mag], [g_mag, 0.0], [0.0, 0.0]],
@@ -263,6 +298,13 @@ def run_batch_vio_optimization(
         add_block(row_cursor, 9, np.eye(3) * w_bg0)
         add_block(row_cursor + 3, 12, np.eye(3) * w_ba0)
         row_cursor += 6
+
+        # --- Factor A2: Camera/IMU time-offset prior ---
+        if estimate_time_offset:
+            w_td = 1.0 / max(time_offset_prior_s, 1e-6)
+            res_list.append(np.array([td_cur * w_td], dtype=np.float64))
+            add_block(row_cursor, td_col, np.array([[w_td]], dtype=np.float64))
+            row_cursor += 1
 
         # --- Factor B: 1000 Hz IMU Preintegration + Bias Random Walk (15*(N-1) residuals) ---
         for k in range(N - 1):
@@ -314,12 +356,12 @@ def run_batch_vio_optimization(
         # --- Factor C: Stationary Anchor AprilTag Corners (cam1) ---
         # Weight anchor corners by realistic measurement noise; overly tight sigma
         # can overfit corner jitter and couple rotation into translation.
-        res_anc, err_anc_px, J_anc_state, _ = evaluate_visual_residuals_and_jacobians(
+        res_anc, err_anc_px, J_anc_state, _, J_anc_td = evaluate_visual_residuals_and_jacobians(
             R_cur, p_cur, v_cur, bg_cur, omega_raw,
             anchor_packed["pts_world"],
             anchor_packed["frame_idx"],
             anchor_packed["uv_meas"],
-            cam1, dt_offset,
+            cam1, td_cur,
             sigma_px=anchor_sigma_px,
             huber_delta_px=anchor_huber_delta_px,
             gyro_correction=gyro_correction,
@@ -334,6 +376,10 @@ def run_batch_vio_optimization(
             rows.append(np.broadcast_to(r_base, f_cols_2.shape).ravel())
             cols.append(f_cols_2.ravel())
             vals.append(J_anc_state.reshape(2 * K_anc, 15).ravel())
+            if estimate_time_offset:
+                rows.append(np.broadcast_to(r_base, (2 * K_anc, 1)).ravel())
+                cols.append(np.full(2 * K_anc, td_col, dtype=np.int64))
+                vals.append(J_anc_td.ravel())
             row_cursor += 2 * K_anc
 
         # --- Factor D: Rear-Cam KLT Landmarks Bundle Adjustment (cam1) ---
@@ -341,12 +387,12 @@ def run_batch_vio_optimization(
         err_klt_px = np.zeros((0, 2))
         if K_klt > 0 and M > 0:
             pts_klt_w = lm_cur[klt_packed["lm_idx"]]
-            res_klt, err_klt_px, J_klt_state, J_klt_pt = evaluate_visual_residuals_and_jacobians(
+            res_klt, err_klt_px, J_klt_state, J_klt_pt, J_klt_td = evaluate_visual_residuals_and_jacobians(
                 R_cur, p_cur, v_cur, bg_cur, omega_raw,
                 pts_klt_w,
                 klt_packed["frame_idx"],
                 klt_packed["uv_meas"],
-                cam1, dt_offset,
+                cam1, td_cur,
                 sigma_px=klt_sigma_px,
                 huber_delta_px=huber_delta_px,
                 gyro_correction=gyro_correction,
@@ -368,6 +414,11 @@ def run_batch_vio_optimization(
             rows.append(np.broadcast_to(r_base, l_cols_2.shape).ravel())
             cols.append(l_cols_2.ravel())
             vals.append(J_klt_pt.reshape(2 * K_klt, 3).ravel())
+
+            if estimate_time_offset:
+                rows.append(np.broadcast_to(r_base, (2 * K_klt, 1)).ravel())
+                cols.append(np.full(2 * K_klt, td_col, dtype=np.int64))
+                vals.append(J_klt_td.ravel())
             row_cursor += 2 * K_klt
 
         r_vec = np.concatenate(res_list)
@@ -378,7 +429,7 @@ def run_batch_vio_optimization(
         cost = 0.5 * float(np.dot(r_vec, r_vec))
         return cost, r_vec, J_mat, err_anc_px, err_klt_px
 
-    def apply_update(R_cur, p_cur, v_cur, bg_cur, ba_cur, lm_cur, Rg_cur, dx: np.ndarray):
+    def apply_update(R_cur, p_cur, v_cur, bg_cur, ba_cur, lm_cur, Rg_cur, td_cur, dx: np.ndarray):
         R_new = R_cur.copy()
         p_new = p_cur.copy()
         v_new = v_cur.copy()
@@ -396,12 +447,17 @@ def run_batch_vio_optimization(
         lm_new = lm_cur + dx[n_state_vars:grav_col_offset].reshape(M, 3) if M > 0 else lm_cur.copy()
         dg = dx[grav_col_offset : grav_col_offset + 2]
         Rg_new = Rg_cur @ so3_exp(np.array([dg[0], dg[1], 0.0], dtype=np.float64))
-        return R_new, p_new, v_new, bg_new, ba_new, lm_new, Rg_new
+        if estimate_time_offset:
+            td_new = float(np.clip(td_cur + dx[td_col], -TD_MAX, TD_MAX))
+        else:
+            td_new = 0.0
+        return R_new, p_new, v_new, bg_new, ba_new, lm_new, Rg_new, td_new
 
     # 3. Levenberg-Marquardt Optimization Loop
     cost, r_vec, J_mat, err_anc_0, err_klt_0 = build_system(
-        R_wi, p_wi, v_w, bg, ba, landmarks, R_g
+        R_wi, p_wi, v_w, bg, ba, landmarks, R_g, td
     )
+    err_anc_fin, err_klt_fin = err_anc_0, err_klt_0
     init_anc_rmse = float(np.sqrt(np.mean(np.sum(err_anc_0 ** 2, axis=1)))) if len(err_anc_0) else 0.0
     init_klt_rmse = float(np.sqrt(np.mean(np.sum(err_klt_0 ** 2, axis=1)))) if len(err_klt_0) else 0.0
     print(f"[Init] Cost: {cost:.1f} | Anchor RMSE: {init_anc_rmse:.2f} px | KLT RMSE: {init_klt_rmse:.2f} px")
@@ -421,17 +477,17 @@ def run_batch_vio_optimization(
                 lam *= 10.0
                 continue
 
-            R_try, p_try, v_try, bg_try, ba_try, lm_try, Rg_try = apply_update(
-                R_wi, p_wi, v_w, bg, ba, landmarks, R_g, dx
+            R_try, p_try, v_try, bg_try, ba_try, lm_try, Rg_try, td_try = apply_update(
+                R_wi, p_wi, v_w, bg, ba, landmarks, R_g, td, dx
             )
             cost_try, r_try, J_try, err_anc_try, err_klt_try = build_system(
-                R_try, p_try, v_try, bg_try, ba_try, lm_try, Rg_try
+                R_try, p_try, v_try, bg_try, ba_try, lm_try, Rg_try, td_try
             )
 
             if cost_try < cost:
                 step_norm = float(np.linalg.norm(dx))
-                R_wi, p_wi, v_w, bg, ba, landmarks, R_g = (
-                    R_try, p_try, v_try, bg_try, ba_try, lm_try, Rg_try
+                R_wi, p_wi, v_w, bg, ba, landmarks, R_g, td = (
+                    R_try, p_try, v_try, bg_try, ba_try, lm_try, Rg_try, td_try
                 )
                 cost, r_vec, J_mat = cost_try, r_try, J_try
                 err_anc_fin, err_klt_fin = err_anc_try, err_klt_try
@@ -457,7 +513,7 @@ def run_batch_vio_optimization(
                 reint_count += 1
         if reint_count > 0:
             cost, r_vec, J_mat, err_anc_fin, err_klt_fin = build_system(
-                R_wi, p_wi, v_w, bg, ba, landmarks, R_g
+                R_wi, p_wi, v_w, bg, ba, landmarks, R_g, td
             )
 
         anc_rmse = float(np.sqrt(np.mean(np.sum(err_anc_fin ** 2, axis=1)))) if len(err_anc_fin) else 0.0
@@ -472,7 +528,10 @@ def run_batch_vio_optimization(
     elapsed = time.perf_counter() - t0
     print(f"Batch VIO optimization finished in {elapsed:.2f} s.")
 
-    # Assemble 4x4 homogeneous transforms for IMU and rear camera (cam1)
+    # Assemble 4x4 homogeneous transforms for IMU and rear camera (cam1).
+    # The optimizer's world frame is inherited from T_world_tag = I, so gravity
+    # is generally not aligned with -Z. Rotate the complete solution into a
+    # gravity-aligned world frame, which is also the Z-up frame used by Rerun.
     T_world_imu = np.repeat(np.eye(4, dtype=np.float64)[None, :, :], N, axis=0)
     T_world_imu[:, :3, :3] = R_wi
     T_world_imu[:, :3, 3] = p_wi
@@ -480,15 +539,27 @@ def run_batch_vio_optimization(
     T_imu_cam1 = vio_data["cams"]["cam1"]["T_imu_cam"]
     T_world_cam1 = T_world_imu @ T_imu_cam1[None, :, :]
 
-    gravity_world = R_g @ np.array([0.0, 0.0, -g_mag], dtype=np.float64)
+    R_align = R_g.T
+    T_align = np.eye(4, dtype=np.float64)
+    T_align[:3, :3] = R_align
+    T_world_imu = T_align[None, :, :] @ T_world_imu
+    T_world_cam1 = T_align[None, :, :] @ T_world_cam1
+    v_world_out = v_w @ R_align.T
+    landmarks_out = landmarks @ R_align.T
+    gravity_world = R_align @ (R_g @ np.array([0.0, 0.0, -g_mag], dtype=np.float64))
 
     return {
         "t_cam1": np.asarray(vio_data["t_cam1"], dtype=np.float64),
         "T_world_imu": T_world_imu,
         "T_world_cam1": T_world_cam1,
-        "v_world": v_w,
+        "v_world": v_world_out,
         "b_gyro": bg,
         "b_accel": ba,
-        "landmarks_world": landmarks,
+        "landmarks_world": landmarks_out,
         "gravity_world": gravity_world,
+        "R_gravity_align": R_align,
+        "td_cam_imu": float(td),
+        "rolling_shutter_readout_s": float(
+            cam1.get("rolling_shutter_readout_s") or 0.0
+        ),
     }

@@ -16,6 +16,7 @@ DEFAULT_RUN_CONFIG = {
     "frontend": {
         "max_corners_per_cam": 220,
         "min_track_len": 5,
+        "min_parallax_deg": 0.15,
     },
     "optimizer": {
         "max_iters": 40,
@@ -27,7 +28,13 @@ DEFAULT_RUN_CONFIG = {
         "init_prior_trans": 0.0,
         # Inflate KLT sigma/Huber by (1 + scale * ||omega|| [rad/s]) during
         # fast rotation to reduce motion-blur / high-rate coupling influence.
-        "klt_omega_rate_scale": 0.5,
+        "klt_omega_rate_scale": 0.15,
+        # Rolling-shutter readout in seconds. None uses the value logged by
+        # converter.py from the .insv telemetry; 0 disables compensation.
+        "rolling_shutter_readout_s": None,
+        # Online estimation of the camera-minus-IMU timing offset.
+        "estimate_time_offset": True,
+        "time_offset_prior_s": 0.005,
     },
 }
 
@@ -53,15 +60,20 @@ def _merge_known(base: dict, override: dict, prefix: str = "config") -> dict:
                     f"{prefix}.{key} must be a number, got {type(value).__name__}"
                 )
             value = float(value)
+        elif isinstance(expected, bool):
+            if not isinstance(value, bool):
+                raise ValueError(
+                    f"{prefix}.{key} must be a boolean, got {type(value).__name__}"
+                )
         elif isinstance(expected, int):
             if not isinstance(value, int) or isinstance(value, bool):
                 raise ValueError(
                     f"{prefix}.{key} must be an integer, got {type(value).__name__}"
                 )
         elif expected is None:
-            if value is not None and not isinstance(value, str):
+            if value is not None and not isinstance(value, (str, int, float)):
                 raise ValueError(
-                    f"{prefix}.{key} must be a string or null, got "
+                    f"{prefix}.{key} must be a string, number, or null, got "
                     f"{type(value).__name__}"
                 )
         elif isinstance(expected, str):

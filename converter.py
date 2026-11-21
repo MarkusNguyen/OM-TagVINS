@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 import cv2
+import numpy as np
 import rerun as rr
 
 MAGIC = b"8db42d694ccc418790edff439fe026bf"
@@ -81,6 +82,47 @@ def read(path, offset, length):
     with path.open("rb") as handle:
         handle.seek(offset)
         return handle.read(length)
+
+
+def load_rolling_shutter_readout_s(source: Path) -> float:
+    """Read Insta360 frame_readout_time (ms) and return seconds.
+
+    Mirrors specialist-ai/specialist: the X3 metadata stores the full-frame
+    rolling-shutter readout in the first telemetry record under
+    Lens.Data.frame_readout_time, in milliseconds.
+    """
+    try:
+        import telemetry_parser
+    except ImportError as exc:  # pragma: no cover - dependency guard
+        raise RuntimeError(
+            "telemetry-parser is required to read Insta360 rolling-shutter "
+            "metadata; install config/requirements.txt"
+        ) from exc
+
+    parser = telemetry_parser.Parser(str(source))
+    telemetry = parser.telemetry()
+    if not isinstance(telemetry, (list, tuple)) or not telemetry:
+        raise RuntimeError(f"{source} has no telemetry metadata")
+
+    meta = telemetry[0]
+    lens = meta.get("Lens", {}).get("Data", {}) if isinstance(meta, dict) else {}
+    raw = lens.get("frame_readout_time")
+    if raw is None:
+        raise RuntimeError(f"{source} has no Lens.Data.frame_readout_time")
+
+    readout_s = float(raw) * 1e-3
+    if not np.isfinite(readout_s) or readout_s < 0.0:
+        raise RuntimeError(f"Invalid rolling-shutter readout in {source}: {raw}")
+    return readout_s
+
+
+def log_rolling_shutter_readout_s(readout_s: float) -> None:
+    """Store the readout on the base Rerun recording's time timeline."""
+    rr.send_columns(
+        "calibration/rolling_shutter_readout_s",
+        indexes=[rr.TimeColumn("time", duration=[0.0])],
+        columns=rr.Scalars.columns(scalars=[float(readout_s)]),
+    )
 
 
 def imu_samples(data, info):
@@ -165,6 +207,7 @@ def export(source):
         raise FileNotFoundError(f"INSV file not found: {source}")
 
     samples, reference = load_imu(source)
+    readout_s = load_rolling_shutter_readout_s(source)
     origin = min(samples[0][0], reference)
     target = OUTPUT_DIR / f"{source.stem}.rrd"
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -175,6 +218,7 @@ def export(source):
     try:
         rr.init(source.stem)
         rr.save(target)
+        log_rolling_shutter_readout_s(readout_s)
         log_imu(samples, origin)
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         frames = log_frames(cap, fps, reference, origin)
@@ -184,6 +228,7 @@ def export(source):
 
     if not frames:
         raise RuntimeError(f"{source} has no frames")
+    print(f"Rolling-shutter readout: {readout_s * 1e3:.3f} ms")
     return target
 
 

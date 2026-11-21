@@ -6,13 +6,6 @@ import numpy as np
 import rerun as rr
 
 
-# The gyro stream in the .rrd uses the opposite sign convention from the
-# right-hand body-frame angular velocity expected by so3_exp() in
-# src/gyro.py and src/imu_preintegration.py. Negate it once here so bias
-# estimation, gyro-aided tracking and IMU preintegration all agree.
-GYRO_SIGN = -1.0
-
-
 def load_calibration(yaml_path: str, actual_wh: tuple[int, int]) -> tuple[dict, dict]:
     """
     Loads calib.yaml and automatically scales focal length & principal point
@@ -40,6 +33,7 @@ def load_calibration(yaml_path: str, actual_wh: tuple[int, int]) -> tuple[dict, 
         fx, fy, cx, cy = c["intrinsics"]
         T_cam_imu = np.array(c["T_cam_imu"], dtype=np.float64)
 
+        raw_readout = c.get("rolling_shutter_readout_s", c.get("frame_readout_time"))
         cams[name] = {
             "resolution": (actual_w, actual_h),
             "scale": scale_x,
@@ -51,6 +45,11 @@ def load_calibration(yaml_path: str, actual_wh: tuple[int, int]) -> tuple[dict, 
             "timeshift": float(c["timeshift_cam_imu"]),
             "T_cam_imu": T_cam_imu,
             "T_imu_cam": np.linalg.inv(T_cam_imu),  # Body-from-camera for GTSAM
+            # None means "unspecified here"; converter metadata or config/vio.yaml
+            # may supply it. An explicit 0.0 disables rolling-shutter compensation.
+            "rolling_shutter_readout_s": (
+                float(raw_readout) if raw_readout is not None else None
+            ),
         }
 
     imu_cfg = dict(cfg["imu0"])
@@ -64,6 +63,17 @@ def load_calibration(yaml_path: str, actual_wh: tuple[int, int]) -> tuple[dict, 
         if "gyro_misalignment" in imu_cfg:
             Cg = Cg @ np.array(imu_cfg["gyro_misalignment"], dtype=np.float64).reshape(3, 3)
     imu_cfg["gyro_correction"] = Cg
+
+    # Optional fixed accel scale/misalignment correction:
+    #   a_corrected = C_a @ a_raw
+    if "accel_correction" in imu_cfg:
+        Ca = np.array(imu_cfg["accel_correction"], dtype=np.float64).reshape(3, 3)
+    else:
+        ascale = np.array(imu_cfg.get("accel_scale", [1.0, 1.0, 1.0]), dtype=np.float64)
+        Ca = np.diag(ascale)
+        if "accel_misalignment" in imu_cfg:
+            Ca = Ca @ np.array(imu_cfg["accel_misalignment"], dtype=np.float64).reshape(3, 3)
+    imu_cfg["accel_correction"] = Ca
 
     return cams, imu_cfg
 
@@ -163,6 +173,27 @@ def _timeline_to_seconds(column) -> np.ndarray:
     return seconds
 
 
+def _scalar_cell_to_float(cell) -> float:
+    """Unwrap Rerun scalar cells (possibly nested arrays/lists) to a float."""
+    obj = cell
+    for _ in range(8):
+        if isinstance(obj, np.ndarray):
+            if obj.dtype != object:
+                return float(np.asarray(obj).reshape(-1)[0])
+            if obj.size == 0:
+                break
+            obj = obj.reshape(-1)[0]
+        elif isinstance(obj, (list, tuple)):
+            if not obj:
+                break
+            obj = obj[0]
+        elif isinstance(obj, memoryview):
+            return float(np.frombuffer(obj, dtype=np.float64)[0])
+        else:
+            return float(obj)
+    raise ValueError(f"Could not decode scalar Rerun cell: {cell!r}")
+
+
 def load_base_rrd(rrd_path: str, timeline: str = "time") -> dict:
     """
     Reads synchronized camera frames and raw IMU channels from base.rrd.
@@ -202,7 +233,7 @@ def load_base_rrd(rrd_path: str, timeline: str = "time") -> dict:
             return vals.to_numpy(dtype=np.float64)
 
         accel_raw = np.column_stack([_col("/imu/accel/x"), _col("/imu/accel/y"), _col("/imu/accel/z")])
-        gyro_raw  = GYRO_SIGN * np.column_stack([_col("/imu/gyro/x"),  _col("/imu/gyro/y"),  _col("/imu/gyro/z")])
+        gyro_raw  = np.column_stack([_col("/imu/gyro/x"),  _col("/imu/gyro/y"),  _col("/imu/gyro/z")])
 
         # 2. Query the rear camera stream only.
         cam_df = (
@@ -222,12 +253,32 @@ def load_base_rrd(rrd_path: str, timeline: str = "time") -> dict:
         # Keep encoded blobs (cheap) and decode frames lazily on access.
         rear_imgs = LazyImageSequence(cam_df[rear_col].tolist())
 
+        # 3. Optional rolling-shutter readout stored by converter.py from the
+        # Insta360 .insv telemetry (specialist-style metadata extraction).
+        rolling_shutter_readout_s = None
+        readout_entity = "/calibration/rolling_shutter_readout_s"
+        try:
+            rs_df = (
+                dataset.filter_contents([readout_entity])
+                .reader(index=timeline, fill_latest_at=True)
+                .to_pandas()
+            )
+            rs_cols = [c for c in rs_df.columns if c.startswith(readout_entity + ":")]
+            if rs_cols:
+                values = rs_df[rs_cols[0]].dropna()
+                if not values.empty:
+                    rolling_shutter_readout_s = _scalar_cell_to_float(values.iloc[-1])
+        except Exception:
+            # Older base .rrd files were written without this entity.
+            rolling_shutter_readout_s = None
+
     return {
         "t_cam_raw": t_cam_raw,
         "rear_imgs": rear_imgs,
         "t_imu": t_imu,
         "accel_raw": accel_raw,
         "gyro_raw": gyro_raw,
+        "rolling_shutter_readout_s": rolling_shutter_readout_s,
     }
 
 
@@ -349,6 +400,24 @@ def prepare_vio_inputs(rrd_path: str, yaml_path: str, timeline: str = "time") ->
     med_norm = np.median(np.linalg.norm(raw["accel_raw"][:500], axis=1))
     accel_ms2 = raw["accel_raw"] * g_mag if med_norm < 3.0 else raw["accel_raw"].copy()
 
+    # Apply fixed accelerometer scale/misalignment correction. Rows are vectors,
+    # so a_corrected = C_a @ a becomes a @ C_a.T.
+    accel_ms2 = accel_ms2 @ imu_cfg["accel_correction"].T
+
+    # The RRD gyro stream uses the opposite sign convention from the right-hand
+    # body-frame angular velocity expected by so3_exp() and the IMU factor.
+    # Keep the sign explicit in the calibration YAML instead of hiding it here.
+    gyro_sign = float(imu_cfg.get("gyro_sign", 1.0))
+    gyro_raw = raw["gyro_raw"] * gyro_sign
+
+    # Check 2b: Specialist-style rolling-shutter metadata. The converter stores
+    # Lens.Data.frame_readout_time in the base .rrd; calib/config values win.
+    rrd_readout = raw.get("rolling_shutter_readout_s")
+    if rrd_readout is not None:
+        for cam in cams.values():
+            if cam.get("rolling_shutter_readout_s") is None:
+                cam["rolling_shutter_readout_s"] = float(rrd_readout)
+
     # Check 3: Apply per-camera hardware timeshift_cam_imu
     t_cam1 = raw["t_cam_raw"] + cams["cam1"]["timeshift"]  # Rear (_00_)
 
@@ -356,11 +425,11 @@ def prepare_vio_inputs(rrd_path: str, yaml_path: str, timeline: str = "time") ->
     # is rear-only, so do not introduce a front-camera (cam0) time shift here.
     t_first_frame = raw["t_cam_raw"][0] + cams["cam1"]["timeshift"]
     b_gyro_0, R_I_G_0 = initialize_static_imu(
-        raw["t_imu"], accel_ms2, raw["gyro_raw"], t_first_frame=t_first_frame
+        raw["t_imu"], accel_ms2, gyro_raw, t_first_frame=t_first_frame
     )
 
     # Check 4: Trim unpaired IMU and slice exact [t_k, t_{k+1}] intervals for the rear camera.
-    imu_intervals_cam1 = slice_imu_intervals(t_cam1, raw["t_imu"], accel_ms2, raw["gyro_raw"])
+    imu_intervals_cam1 = slice_imu_intervals(t_cam1, raw["t_imu"], accel_ms2, gyro_raw)
 
     return {
         "cams": cams,
@@ -370,4 +439,5 @@ def prepare_vio_inputs(rrd_path: str, yaml_path: str, timeline: str = "time") ->
         "b_gyro_0": b_gyro_0,
         "R_I_G_0": R_I_G_0,
         "imu_intervals_cam1": imu_intervals_cam1,
+        "rolling_shutter_readout_s": cams["cam1"].get("rolling_shutter_readout_s"),
     }

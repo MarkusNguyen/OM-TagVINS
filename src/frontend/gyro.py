@@ -6,7 +6,7 @@ for the pipeline entry points that call these helpers.
 
 import numpy as np
 
-from .lie_algebra import so3_exp
+from ..core.lie_algebra import so3_exp
 
 
 def integrate_gyro_rotation(
@@ -31,6 +31,41 @@ def integrate_gyro_rotation(
         R_prev_curr = R_prev_curr @ so3_exp(omega_mid * float(dts[j]))
 
     return R_prev_curr
+
+
+def compensate_rolling_shutter_rays(
+    uv: np.ndarray,
+    rays_cam: np.ndarray,
+    cam: dict,
+    omega_unb: np.ndarray,
+    td_s: float = 0.0,
+) -> np.ndarray:
+    """
+    Map measured fisheye bearing rays to the nominal frame timestamp.
+
+    The frame timestamp is treated as the center-row exposure time. Each row is
+    exposed at dt = td_s + (v - h/2)/h * readout_s. To express a ray measured at
+    that exposure in the nominal camera frame, apply the inverse camera-frame
+    rotation: r_nom = R_CI @ Exp(omega*dt) @ R_IC @ r_meas.
+    """
+    rays_cam = np.asarray(rays_cam, dtype=np.float64)
+    if len(rays_cam) == 0:
+        return rays_cam.copy()
+
+    readout = float(cam.get("rolling_shutter_readout_s") or 0.0)
+    if readout <= 0.0:
+        return rays_cam.copy()
+
+    h_px = float(cam["resolution"][1])
+    dt_rows = float(td_s) + (np.asarray(uv, dtype=np.float64)[:, 1] - 0.5 * h_px) / h_px * readout
+    omega = np.asarray(omega_unb, dtype=np.float64).reshape(3)
+    R_ci = np.asarray(cam["T_cam_imu"][:3, :3], dtype=np.float64)
+
+    rays_nom = np.empty_like(rays_cam)
+    for i, dt in enumerate(dt_rows):
+        R_off = so3_exp(omega * float(dt))
+        rays_nom[i] = R_ci @ R_off @ R_ci.T @ rays_cam[i]
+    return rays_nom
 
 
 def compute_camera_relative_rotation(R_I_prev_curr: np.ndarray, cam: dict) -> np.ndarray:

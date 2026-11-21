@@ -6,3 +6,4 @@ PyYAML>=6.0,<7
 rerun-sdk>=0.37,<0.38
 pupil-apriltags>=1.0.4,<2
 pandas>=2,<3
+telemetry-parser>=0.4

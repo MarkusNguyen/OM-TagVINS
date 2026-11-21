@@ -6,8 +6,8 @@ for the pipeline entry points that call these helpers.
 
 import numpy as np
 
-from .camera_model import project_kannala_brandt
-from .constants import ACTIVE_CAMS
+from ..core.camera_model import project_kannala_brandt
+from ..core.constants import ACTIVE_CAMS
 
 
 def triangulate_bearing_rays(T_cam_worlds: list[np.ndarray], rays_cam: list[np.ndarray]) -> np.ndarray | None:
@@ -42,7 +42,7 @@ def triangulate_klt_tracks(
     klt_tracks: dict,
     init_poses_world_imu: dict[int, np.ndarray],
     cams: dict,
-    min_parallax_deg: float = 1.0,
+    min_parallax_deg: float = 0.5,
     max_reproj_px: float = 3.0,
 ) -> dict:
     """Triangulates initial 3D world coordinates for rear-camera KLT tracks."""

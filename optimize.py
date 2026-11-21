@@ -12,26 +12,26 @@ import numpy as np
 from frontend import extract_visual_measurements
 from preprocess import prepare_vio_inputs
 from config.settings import DEFAULT_CONFIG_PATH, load_run_config
-from src.camera_model import project_kannala_brandt, project_kb_with_jacobian
-from src.imu_preintegration import PreintegratedIMUFactor
-from src.lie_algebra import (
+from src.backend.imu_preintegration import PreintegratedIMUFactor
+from src.backend.vio_initialization import (
+    extract_frame_gyros,
+    initialize_vio_states,
+    pack_visual_observations,
+)
+from src.backend.vio_solver import (
+    evaluate_visual_residuals_and_jacobians,
+    huber_irls_weights,
+    run_batch_vio_optimization,
+)
+from src.core.camera_model import project_kannala_brandt, project_kb_with_jacobian
+from src.core.lie_algebra import (
     skew,
     so3_exp,
     so3_inv_right_jacobian,
     so3_log,
     so3_right_jacobian,
 )
-from src.rerun_logger import log_optimized_vio_to_rerun
-from src.vio_initialization import (
-    extract_frame_gyros,
-    initialize_vio_states,
-    pack_visual_observations,
-)
-from src.vio_solver import (
-    evaluate_visual_residuals_and_jacobians,
-    huber_irls_weights,
-    run_batch_vio_optimization,
-)
+from src.viz.rerun_logger import log_optimized_vio_to_rerun
 
 def run_vio(
     rrd: str | Path,
@@ -44,6 +44,7 @@ def run_vio(
     anchor_size: float | None = None,
     max_corners_per_cam: int | None = None,
     min_track_len: int | None = None,
+    min_parallax_deg: float | None = None,
     max_iters: int | None = None,
     anchor_sigma: float | None = None,
     klt_sigma: float | None = None,
@@ -52,6 +53,9 @@ def run_vio(
     init_prior_rot: float | None = None,
     init_prior_trans: float | None = None,
     klt_omega_rate_scale: float | None = None,
+    rolling_shutter_readout_s: float | None = None,
+    estimate_time_offset: bool | None = None,
+    time_offset_prior_s: float | None = None,
 ) -> dict:
     """Run full-batch IMU-aided VIO on a base .rrd recording.
 
@@ -68,6 +72,8 @@ def run_vio(
         max_corners_per_cam = cfg["frontend"]["max_corners_per_cam"]
     if min_track_len is None:
         min_track_len = cfg["frontend"]["min_track_len"]
+    if min_parallax_deg is None:
+        min_parallax_deg = cfg["frontend"]["min_parallax_deg"]
     if max_iters is None:
         max_iters = cfg["optimizer"]["max_iters"]
     if anchor_sigma is None:
@@ -84,6 +90,12 @@ def run_vio(
         init_prior_trans = cfg["optimizer"]["init_prior_trans"]
     if klt_omega_rate_scale is None:
         klt_omega_rate_scale = cfg["optimizer"]["klt_omega_rate_scale"]
+    if rolling_shutter_readout_s is None:
+        rolling_shutter_readout_s = cfg["optimizer"]["rolling_shutter_readout_s"]
+    if estimate_time_offset is None:
+        estimate_time_offset = cfg["optimizer"]["estimate_time_offset"]
+    if time_offset_prior_s is None:
+        time_offset_prior_s = cfg["optimizer"]["time_offset_prior_s"]
 
     print(f"VIO config: {config}")
 
@@ -95,6 +107,19 @@ def run_vio(
         viz = str(Path("logs/estimate") / f"{rrd_stem}_vio.rrd")
 
     vio_data = prepare_vio_inputs(rrd, calib)
+
+    # Explicit config/CLI readout overrides the metadata logged by converter.py.
+    if rolling_shutter_readout_s is not None:
+        rolling_shutter_readout_s = float(rolling_shutter_readout_s)
+        for cam in vio_data["cams"].values():
+            cam["rolling_shutter_readout_s"] = rolling_shutter_readout_s
+        vio_data["rolling_shutter_readout_s"] = rolling_shutter_readout_s
+
+    print(
+        f"Rolling-shutter readout: "
+        f"{vio_data['cams']['cam1'].get('rolling_shutter_readout_s')} s | "
+        f"estimate time offset: {estimate_time_offset}"
+    )
 
     anchor_tags = {
         anchor_id: {
@@ -108,6 +133,7 @@ def run_vio(
         anchor_tags=anchor_tags,
         max_corners_per_cam=max_corners_per_cam,
         min_track_len=min_track_len,
+        min_parallax_deg=min_parallax_deg,
     )
 
     opt_res = run_batch_vio_optimization(
@@ -121,6 +147,8 @@ def run_vio(
         init_prior_rot=init_prior_rot,
         init_prior_trans=init_prior_trans,
         klt_omega_rate_scale=klt_omega_rate_scale,
+        estimate_time_offset=bool(estimate_time_offset),
+        time_offset_prior_s=float(time_offset_prior_s),
     )
 
     Path(out_npz).parent.mkdir(parents=True, exist_ok=True)

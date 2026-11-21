@@ -1,0 +1,5 @@
+# Reference description of the single stationary AprilTag anchor.
+# Runtime values come from config/vio.yaml or --anchor-id / --anchor-size.
+anchor:
+  id: 0
+  size_m: 0.100

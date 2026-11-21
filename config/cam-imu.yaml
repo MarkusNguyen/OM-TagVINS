@@ -30,6 +30,9 @@ cam1:
     - [ 0.000000000000000,  0.000000000000000,  0.000000000000000,  1.000000000000000]
 
 imu0:
+  # Sign of the RRD gyro stream relative to the right-hand body-frame
+  # angular velocity used by so3_exp() and the IMU preintegration factor.
+  gyro_sign: -1.0
   update_rate: 1000.0
   gyroscope_noise_density: 7.853982e-05
   gyroscope_random_walk: 1.9393e-05

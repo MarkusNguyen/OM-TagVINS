@@ -258,6 +258,7 @@ def run_vio_via_optimize(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarr
             anchor_size=args.anchor_size,
             max_corners_per_cam=args.max_corners_per_cam,
             min_track_len=args.min_track_len,
+            min_parallax_deg=args.min_parallax_deg,
             max_iters=args.max_iters,
             anchor_sigma=args.anchor_sigma,
             klt_sigma=args.klt_sigma,
@@ -266,6 +267,9 @@ def run_vio_via_optimize(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarr
             init_prior_rot=args.init_prior_rot,
             init_prior_trans=args.init_prior_trans,
             klt_omega_rate_scale=args.klt_omega_rate_scale,
+            rolling_shutter_readout_s=args.rolling_shutter_readout_s,
+            estimate_time_offset=args.estimate_time_offset,
+            time_offset_prior_s=args.time_offset_prior_s,
         )
         return load_trajectory(vio_npz)
 
@@ -348,6 +352,12 @@ def parse_args() -> argparse.Namespace:
         help="Minimum KLT track length in frames",
     )
     vio.add_argument(
+        "--min-parallax-deg",
+        type=float,
+        default=cfg["frontend"]["min_parallax_deg"],
+        help="Minimum KLT bearing parallax for triangulation (degrees)",
+    )
+    vio.add_argument(
         "--max-iters",
         type=int,
         default=cfg["optimizer"]["max_iters"],
@@ -394,6 +404,35 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=cfg["optimizer"]["init_prior_trans"],
         help="PnP branch-continuity translation prior sigma (m); 0 disables",
+    )
+    vio.add_argument(
+        "--rolling-shutter-readout-s",
+        type=float,
+        default=cfg["optimizer"]["rolling_shutter_readout_s"],
+        help=(
+            "Rolling-shutter full-frame readout in seconds. Default null uses "
+            "the .insv metadata logged by converter.py; 0 disables."
+        ),
+    )
+    timing = vio.add_mutually_exclusive_group()
+    timing.add_argument(
+        "--estimate-time-offset",
+        dest="estimate_time_offset",
+        action="store_true",
+        default=cfg["optimizer"]["estimate_time_offset"],
+        help="Estimate the camera-minus-IMU time offset (default: enabled)",
+    )
+    timing.add_argument(
+        "--no-estimate-time-offset",
+        dest="estimate_time_offset",
+        action="store_false",
+        help="Fix the camera-minus-IMU time offset at zero",
+    )
+    vio.add_argument(
+        "--time-offset-prior-s",
+        type=float,
+        default=cfg["optimizer"]["time_offset_prior_s"],
+        help="Prior sigma on the estimated camera-minus-IMU time offset (s)",
     )
 
     return parser.parse_args()
