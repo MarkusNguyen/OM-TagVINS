@@ -7,7 +7,7 @@ The pipeline estimates a metric 6-DoF camera trajectory by combining:
 - 1000 Hz IMU preintegration
 - AprilTag corner observations of one stationary `tag36h11` anchor
 - Gyro-aided KLT feature tracking
-- A full-batch on-manifold Levenberg-Marquardt optimizer
+- A full-batch GTSAM factor-graph optimizer
 
 Only the rear camera (`cam1`) is used for VIO. The front camera is not used.
 
@@ -72,7 +72,7 @@ The modules are grouped by responsibility:
 | `src/frontend/triangulation.py` | Linear DLT triangulation directly on bearing rays, plus reprojection/parallax filtering to seed initial 3D landmarks. | `triangulate_bearing_rays`, `triangulate_klt_tracks` |
 | `src/backend/imu_preintegration.py` | On-manifold IMU preintegration with 9×9 covariance, gyro/accel corrections, and first-order bias Jacobians. | `PreintegratedIMUFactor` |
 | `src/backend/vio_initialization.py` | Seeds per-frame poses/velocities/biases, landmark positions, and gravity orientation from PnP + IMU data. | `initialize_vio_states`, `refine_initial_velocities`, `extract_frame_gyros`, `pack_visual_observations` |
-| `src/backend/vio_solver.py` | Sparse Levenberg-Marquardt batch optimizer: IMU, anchor, KLT, bias-prior, gravity, and time-offset factors, rolling-shutter compensation, Huber IRLS weighting, per-block LM step caps, gravity-aligned output, and final result arrays. IMU noise densities are passed to preintegration unchanged; the factor converts them to per-sample covariance itself. | `huber_irls_weights`, `evaluate_visual_residuals_and_jacobians`, `run_batch_vio_optimization` |
+| `src/backend/vio_solver.py` | GTSAM batch factor-graph optimizer: IMU, anchor, KLT, bias-prior, and bias-random-walk factors with rolling-shutter-aware custom visual factors, Huber robust noise, and gravity-aligned output. | `huber_irls_weights`, `evaluate_visual_residuals_and_jacobians`, `run_batch_vio_optimization` |
 | `src/viz/rerun_logger.py` | Writes the optimized rear-camera trajectory and per-frame pose axes to a Rerun `.rrd`. | `log_optimized_vio_to_rerun` |
 
 If you want to change how a specific part of the pipeline behaves, edit the
@@ -218,7 +218,7 @@ optimizer:
 
 | Key | Meaning | Default |
 |---|---|---:|
-| `max_iters` | Maximum Levenberg-Marquardt iterations | `40` |
+| `max_iters` | Maximum optimizer iterations | `25` |
 | `anchor_sigma_px` | Anchor corner reprojection noise sigma | `0.10` |
 | `klt_sigma_px` | KLT reprojection noise sigma | `0.40` |
 | `anchor_huber_px` | Huber threshold for anchor residuals | `10.0` |
@@ -318,7 +318,7 @@ The entry points below delegate the actual work to the modules listed in
 
 - Preintegrates IMU measurements between camera frames
 - Initializes per-frame rotation, position, velocity, gyro bias, accelerometer bias, 3D landmarks, and gravity tilt
-- Minimizes IMU, anchor, and KLT residuals with on-manifold Levenberg-Marquardt
+- Minimizes IMU, anchor, and KLT residuals with GTSAM Levenberg-Marquardt
 - Applies Huber weighting to visual residuals
 - Outputs `T_world_imu` and the rear-camera trajectory `T_world_cam1`
 

@@ -75,6 +75,13 @@ def load_calibration(yaml_path: str, actual_wh: tuple[int, int]) -> tuple[dict, 
             Ca = Ca @ np.array(imu_cfg["accel_misalignment"], dtype=np.float64).reshape(3, 3)
     imu_cfg["accel_correction"] = Ca
 
+    # Optional IMU sensor -> body rotation (specialist Insta360 X3 convention).
+    # v_body = body_R_imu @ v_imu; for row vectors: v @ body_R_imu.T
+    if "body_R_imu" in imu_cfg:
+        imu_cfg["body_R_imu"] = np.array(imu_cfg["body_R_imu"], dtype=np.float64).reshape(3, 3)
+    else:
+        imu_cfg["body_R_imu"] = np.eye(3, dtype=np.float64)
+
     return cams, imu_cfg
 
 
@@ -409,6 +416,12 @@ def prepare_vio_inputs(rrd_path: str, yaml_path: str, timeline: str = "time") ->
     # Keep the sign explicit in the calibration YAML instead of hiding it here.
     gyro_sign = float(imu_cfg.get("gyro_sign", 1.0))
     gyro_raw = raw["gyro_raw"] * gyro_sign
+
+    # Rotate IMU samples from sensor frame to body frame (specialist X3 convention).
+    body_R_imu = np.asarray(imu_cfg.get("body_R_imu", np.eye(3)), dtype=np.float64).reshape(3, 3)
+    if not np.allclose(body_R_imu, np.eye(3)):
+        accel_ms2 = accel_ms2 @ body_R_imu.T
+        gyro_raw = gyro_raw @ body_R_imu.T
 
     # Check 2b: Specialist-style rolling-shutter metadata. The converter stores
     # Lens.Data.frame_readout_time in the base .rrd; calib/config values win.

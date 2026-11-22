@@ -1,12 +1,14 @@
 frontend:
   max_corners_per_cam: 220
   min_track_len: 5
-  min_parallax_deg: 1.0
+  min_parallax_deg: 0.5
 
 optimizer:
-  max_iters: 25
-  anchor_sigma_px: 0.05
-  klt_sigma_px: 0.80
-  anchor_huber_px: 10.0
-  klt_huber_px: 2.5
-  klt_omega_rate_scale: 0.60
+  max_iters: 30
+  anchor_sigma_px: 1.05
+  klt_sigma_px: 0.5
+  anchor_huber_px: 1.41
+  klt_huber_px: 0.67
+  klt_omega_rate_scale: 0.0
+  rolling_shutter_readout_s: 0.0
+  estimate_time_offset: false
