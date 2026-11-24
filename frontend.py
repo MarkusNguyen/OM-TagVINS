@@ -59,9 +59,11 @@ def extract_visual_measurements(
     }
 
     anchor_corners_world = {}
+    anchor_corners_local = {}
     for tid, info in anchor_tags.items():
         local_4x3 = get_tag_corners_3d(info["size_m"])
         local_hom = np.hstack([local_4x3, np.ones((4, 1), dtype=np.float64)])
+        anchor_corners_local[tid] = local_4x3
         anchor_corners_world[tid] = (info["T_world_tag"] @ local_hom.T).T[:, :3]
 
     anchor_obs = []
@@ -113,6 +115,9 @@ def extract_visual_measurements(
                     "corners_uv": corners_uv,
                     "corners_rays": rays,
                     "corners_world": anchor_corners_world[tid],
+                    # Local tag-frame corners let the backend optimize the anchor
+                    # pose instead of treating it as a fixed world transform.
+                    "corners_local": anchor_corners_local[tid],
                 })
 
                 # PnP initialization should use the same rolling-shutter model
@@ -138,6 +143,17 @@ def extract_visual_measurements(
             dR_c1_c0 = compute_camera_relative_rotation(R_I_prev_curr, cam) if R_I_prev_curr is not None else None
             trackers[cam_name].step(k, gray_rear, dR_c1_c0=dR_c1_c0)
 
+    if not anchor_obs:
+        raise RuntimeError(
+            "No AprilTag anchor observations were found. The VIO backend "
+            "needs at least one anchor sighting to fix the world gauge."
+        )
+    if not init_poses_world_imu:
+        raise RuntimeError(
+            "The AprilTag anchor was detected but planar PnP failed for every "
+            "sighting; cannot initialize VIO poses."
+        )
+
     klt_tracks = {
         cam_name: {tid: obs for tid, obs in trk.tracks.items() if len(obs) >= min_track_len}
         for cam_name, trk in trackers.items()
@@ -155,6 +171,12 @@ def extract_visual_measurements(
         "init_poses_world_imu": init_poses_world_imu,
         "klt_tracks": klt_tracks,
         "landmarks_world": landmarks_world,
+        # Initial guesses for the optimizable anchor pose variables. The backend
+        # keeps these as free variables with a tilt-free gauge prior.
+        "anchor_poses_world": {
+            tid: np.asarray(info["T_world_tag"], dtype=np.float64).copy()
+            for tid, info in anchor_tags.items()
+        },
     }
 
 

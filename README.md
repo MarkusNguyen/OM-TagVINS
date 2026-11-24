@@ -72,7 +72,7 @@ The modules are grouped by responsibility:
 | `src/frontend/triangulation.py` | Linear DLT triangulation directly on bearing rays, plus reprojection/parallax filtering to seed initial 3D landmarks. | `triangulate_bearing_rays`, `triangulate_klt_tracks` |
 | `src/backend/imu_preintegration.py` | On-manifold IMU preintegration with 9×9 covariance, gyro/accel corrections, and first-order bias Jacobians. | `PreintegratedIMUFactor` |
 | `src/backend/vio_initialization.py` | Seeds per-frame poses/velocities/biases, landmark positions, and gravity orientation from PnP + IMU data. | `initialize_vio_states`, `refine_initial_velocities`, `extract_frame_gyros`, `pack_visual_observations` |
-| `src/backend/vio_solver.py` | GTSAM batch factor-graph optimizer: IMU, anchor, KLT, bias-prior, and bias-random-walk factors with rolling-shutter-aware custom visual factors, Huber robust noise, and gravity-aligned output. | `huber_irls_weights`, `evaluate_visual_residuals_and_jacobians`, `run_batch_vio_optimization` |
+| `src/backend/vio_solver.py` | GTSAM batch factor-graph optimizer: IMU, anchor, KLT, bias-prior, and bias-random-walk factors with rolling-shutter-aware custom visual factors, Huber robust noise, an optimizable anchor pose with a tilt-free gauge prior, and gravity-aligned output. | `huber_irls_weights`, `evaluate_visual_residuals_and_jacobians`, `run_batch_vio_optimization` |
 | `src/viz/rerun_logger.py` | Writes the optimized rear-camera trajectory and per-frame pose axes to a Rerun `.rrd`. | `log_optimized_vio_to_rerun` |
 
 If you want to change how a specific part of the pipeline behaves, edit the
@@ -149,8 +149,9 @@ logs/estimate/60Hz_tcp_vio.rrd
 
 The `.npz` contains `t_tcp`, `T_world_tcp`, `T_tcp0_tcp`, `T_world_cam1`,
 `T_cam_tcp`, and `T_tcp_cam`. The intermediate VIO result also stores
-`td_cam_imu` (estimated camera-minus-IMU offset, seconds) and
-`rolling_shutter_readout_s`. Open the Rerun recording with:
+`td_cam_imu` (estimated camera-minus-IMU offset, seconds),
+`rolling_shutter_readout_s`, and the optimized reference anchor pose
+`T_world_tag`. Open the Rerun recording with:
 
 ```bash
 rerun logs/estimate/60Hz_tcp_vio.rrd

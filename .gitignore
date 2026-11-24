@@ -1,3 +1,6 @@
 *.insv
 *.rrd
 *.npz
+# pixi environments
+.pixi/*
+!.pixi/config.toml

@@ -25,6 +25,12 @@ def initialize_vio_states(
     init_pnp = visual_meas["init_poses_world_imu"]
     b_gyro_0 = np.asarray(vio_data["b_gyro_0"], dtype=np.float64)
 
+    if not init_pnp:
+        raise RuntimeError(
+            "No AprilTag anchor PnP poses are available; cannot initialize the "
+            "VIO world frame. Check anchor visibility and tag configuration."
+        )
+
     R_wi = np.zeros((N, 3, 3), dtype=np.float64)
     p_wi = np.zeros((N, 3), dtype=np.float64)
     v_w = np.zeros((N, 3), dtype=np.float64)
@@ -167,17 +173,26 @@ def extract_frame_gyros(vio_data: dict) -> np.ndarray:
 
 def pack_visual_observations(visual_meas: dict, tid_to_lm_idx: dict):
     """Flattens anchor tag corner observations and KLT track observations into vectorized arrays."""
-    # Anchor tag corners (known 3D world points)
-    anc_frames, anc_pts_w, anc_uv = [], [], []
+    # Anchor tag corners are stored in the tag's local frame. The backend adds
+    # an optimizable anchor pose variable and transforms them into the world
+    # frame inside each visual factor.
+    anc_frames, anc_tag_ids, anc_pts_local, anc_pts_w, anc_uv = [], [], [], [], []
     for obs in visual_meas["anchor_obs"]:
         f_idx = int(obs["frame_idx"])
-        for pt_w, uv in zip(obs["corners_world"], obs["corners_uv"]):
+        tag_id = int(obs["tag_id"])
+        local = np.asarray(obs.get("corners_local"), dtype=np.float64).reshape(-1, 3)
+        world = np.asarray(obs["corners_world"], dtype=np.float64).reshape(-1, 3)
+        for pt_l, pt_w, uv in zip(local, world, obs["corners_uv"]):
             anc_frames.append(f_idx)
+            anc_tag_ids.append(tag_id)
+            anc_pts_local.append(pt_l)
             anc_pts_w.append(pt_w)
             anc_uv.append(uv)
 
     anchor_packed = {
         "frame_idx": np.asarray(anc_frames, dtype=np.int64),
+        "tag_ids": np.asarray(anc_tag_ids, dtype=np.int64),
+        "pts_local": np.asarray(anc_pts_local, dtype=np.float64).reshape(-1, 3),
         "pts_world": np.asarray(anc_pts_w, dtype=np.float64).reshape(-1, 3),
         "uv_meas": np.asarray(anc_uv, dtype=np.float64).reshape(-1, 2),
     }

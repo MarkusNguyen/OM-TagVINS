@@ -240,7 +240,7 @@ def run_vio_via_optimize(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarr
     if not OPTIMIZE_SCRIPT.is_file():
         raise FileNotFoundError(f"VIO backend not found: {OPTIMIZE_SCRIPT}")
 
-    tmp_root = Path("/tmp/opencode")
+    tmp_root = Path(tempfile.gettempdir()) / "opencode"
     tmp_root.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory(prefix="trajectory_vio_", dir=tmp_root) as tmp:

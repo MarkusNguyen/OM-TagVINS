@@ -185,8 +185,9 @@ def _visual_factor(
     key_v: int,
     key_lm: int | None,
     key_td: int | None,
+    key_anchor: int | None,
     uv_meas: np.ndarray,
-    X_world_fixed: np.ndarray | None,
+    X_fixed_local: np.ndarray | None,
     cam: dict,
     omega_unb: np.ndarray,
     td_init: float,
@@ -194,6 +195,15 @@ def _visual_factor(
     huber_px: float,
     klt_omega_rate_scale: float = 0.0,
 ):
+    """One rolling-shutter-aware KB reprojection factor.
+
+    ``key_lm`` is set for KLT landmarks. ``key_anchor`` is set for anchor tag
+    corners, whose local coordinates are transformed by the optimizable anchor
+    pose on every evaluation. Both may not be set at once.
+    """
+    if (key_lm is None) == (key_anchor is None):
+        raise ValueError("A visual factor needs exactly one of key_lm or key_anchor")
+
     R_ci = np.asarray(cam["T_cam_imu"][:3, :3], dtype=np.float64)
     t_ci = np.asarray(cam["T_cam_imu"][:3, 3], dtype=np.float64)
     h_px = float(cam["resolution"][1])
@@ -211,58 +221,42 @@ def _visual_factor(
         huber_eff = huber_px
     noise = _robust_huber(sigma_eff, huber_eff)
 
+    X_local = (
+        np.asarray(X_fixed_local, dtype=np.float64).reshape(3)
+        if key_anchor is not None
+        else None
+    )
+
+    # Fixed key order keeps Jacobian slot lookup simple.
+    keys = [key_x, key_v]
+    if key_lm is not None:
+        keys.append(key_lm)
+    if key_td is not None:
+        keys.append(key_td)
+    if key_anchor is not None:
+        keys.append(key_anchor)
+    td_pos = keys.index(key_td) if key_td is not None else None
+    anchor_pos = keys.index(key_anchor) if key_anchor is not None else None
+    lm_pos = keys.index(key_lm) if key_lm is not None else None
+
     def _skew(v):
         return np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]], dtype=np.float64)
 
     def _get_td(values: gtsam.Values, this: gtsam.CustomFactor) -> float:
-        if key_td is None:
+        if td_pos is None:
             return float(td_init)
-        return float(values.atVector(this.keys()[-1])[0])
+        return float(values.atVector(this.keys()[td_pos])[0])
 
-    if key_lm is None:
-        Xw = np.asarray(X_world_fixed, dtype=np.float64).reshape(3)
-        keys = [key_x, key_v] + ([key_td] if key_td is not None else [])
-
-        def error_func(this: gtsam.CustomFactor, values: gtsam.Values, H: list[np.ndarray] | None):
-            pose = values.atPose3(this.keys()[0])
-            vel = values.atVector(this.keys()[1])
-            td_val = _get_td(values, this)
-            dt_eff = td_val + row_fraction * max(readout, 0.0)
-            R_off_T = so3_exp(om * dt_eff).T
-
-            R_wi = pose.rotation().matrix()
-            p_wi = pose.translation()
-            X_I = R_wi.T @ (Xw - p_wi)
-            v_I = R_wi.T @ vel
-            X_I_off = R_off_T @ X_I - dt_eff * v_I
-            X_C = R_ci @ X_I_off + t_ci
-            uv, J_kb = project_kb_with_jacobian(X_C.reshape(1, 3), cam)
-            err = (uv[0] - uv_meas).astype(np.float64)
-            if H is not None:
-                J_XI_off = J_kb[0] @ R_ci
-                S_XI = _skew(X_I)
-                S_vI = _skew(v_I)
-                dX_dphi = R_off_T @ S_XI - dt_eff * S_vI
-                dX_dp = -R_off_T
-                dX_dv = -dt_eff * R_wi.T
-                Hpose = np.zeros((2, 6), dtype=np.float64)
-                Hpose[:, 0:3] = J_XI_off @ dX_dphi
-                Hpose[:, 3:6] = J_XI_off @ dX_dp
-                H[0] = Hpose
-                H[1] = J_XI_off @ dX_dv
-                if key_td is not None:
-                    dX_dtd = R_off_T @ (S_XI @ om) - v_I
-                    H[-1] = (J_XI_off @ dX_dtd).reshape(2, 1)
-            return err
-
-        return gtsam.CustomFactor(noise, keys, error_func)
-
-    keys = [key_x, key_v, key_lm] + ([key_td] if key_td is not None else [])
+    def _world_point(values: gtsam.Values, this: gtsam.CustomFactor) -> np.ndarray:
+        if anchor_pos is None:
+            return np.asarray(values.atPoint3(this.keys()[lm_pos]), dtype=np.float64)
+        T_w_a = np.asarray(values.atPose3(this.keys()[anchor_pos]).matrix(), dtype=np.float64)
+        return T_w_a[:3, :3] @ X_local + T_w_a[:3, 3]
 
     def error_func(this: gtsam.CustomFactor, values: gtsam.Values, H: list[np.ndarray] | None):
+        Xw = _world_point(values, this)
         pose = values.atPose3(this.keys()[0])
         vel = values.atVector(this.keys()[1])
-        Xw = values.atPoint3(this.keys()[2])
         td_val = _get_td(values, this)
         dt_eff = td_val + row_fraction * max(readout, 0.0)
         R_off_T = so3_exp(om * dt_eff).T
@@ -275,6 +269,7 @@ def _visual_factor(
         X_C = R_ci @ X_I_off + t_ci
         uv, J_kb = project_kb_with_jacobian(X_C.reshape(1, 3), cam)
         err = (uv[0] - uv_meas).astype(np.float64)
+
         if H is not None:
             J_XI_off = J_kb[0] @ R_ci
             S_XI = _skew(X_I)
@@ -287,13 +282,51 @@ def _visual_factor(
             Hpose[:, 3:6] = J_XI_off @ dX_dp
             H[0] = Hpose
             H[1] = J_XI_off @ dX_dv
-            H[2] = J_XI_off @ (R_off_T @ R_wi.T)
-            if key_td is not None:
+
+            if lm_pos is not None:
+                # dX_I / dX_w = R_wi^T, then through the offset/extrinsics.
+                H[lm_pos] = J_XI_off @ (R_off_T @ R_wi.T)
+
+            if anchor_pos is not None:
+                T_w_a = np.asarray(values.atPose3(this.keys()[anchor_pos]).matrix(), dtype=np.float64)
+                R_a = T_w_a[:3, :3]
+                X_a_rot = R_a @ X_local
+                # GTSAM Pose3 retract is a left perturbation:
+                # R' = R Exp(w), t' = t + R dt. Therefore
+                # d(R p)/dw = -[R p]_x R.
+                dXw = np.hstack([-_skew(X_a_rot) @ R_a, R_a])
+                dX_I_off = R_off_T @ R_wi.T @ dXw
+                H[anchor_pos] = J_XI_off @ dX_I_off
+
+            if td_pos is not None:
                 dX_dtd = R_off_T @ (S_XI @ om) - v_I
-                H[-1] = (J_XI_off @ dX_dtd).reshape(2, 1)
+                H[td_pos] = (J_XI_off @ dX_dtd).reshape(2, 1)
+
         return err
 
     return gtsam.CustomFactor(noise, keys, error_func)
+
+
+def _anchor_gauge_noise(
+    world_T_anchor: np.ndarray,
+    sigma_gauge: float = 1e-4,
+    sigma_tilt: float = 1e3,
+) -> gtsam.noiseModel.Base:
+    """Tilt-free gauge prior for the reference anchor.
+
+    Position and yaw are pinned tightly to define the world gauge; the two tilt
+    axes stay free because gravity makes them observable. Mirrors the
+    ``specialist`` anchor gauge prior.
+    """
+    T = np.asarray(world_T_anchor, dtype=np.float64).reshape(4, 4)
+    R = T[:3, :3]
+    up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    free = np.eye(3, dtype=np.float64) - np.outer(up, up)
+    rot_cov = (sigma_tilt ** 2) * free + (sigma_gauge ** 2) * np.outer(up, up)
+    cov = np.zeros((6, 6), dtype=np.float64)
+    cov[:3, :3] = R.T @ rot_cov @ R
+    cov[3:, 3:] = (sigma_gauge ** 2) * np.eye(3, dtype=np.float64)
+    return gtsam.noiseModel.Gaussian.Covariance(cov)
 
 
 def run_batch_vio_optimization(
@@ -366,6 +399,27 @@ def run_batch_vio_optimization(
     td_init = 0.0
     td_key_opt = TD_KEY if estimate_time_offset else None
 
+    # The anchor is an optimizable pose variable. Its initial guess is the
+    # frontend's assumed world_T_tag; after rotation into the gravity-aligned
+    # GTSAM frame, a tilt-free gauge prior pins its position and yaw only.
+    anchor_poses_world = {
+        int(tid): np.asarray(T, dtype=np.float64).reshape(4, 4)
+        for tid, T in visual_meas.get("anchor_poses_world", {}).items()
+    }
+    if not anchor_poses_world:
+        observed_ids = np.unique(anchor_packed["tag_ids"]) if len(anchor_packed["tag_ids"]) else [0]
+        anchor_poses_world = {
+            int(tid): np.eye(4, dtype=np.float64) for tid in observed_ids
+        }
+    if len(anchor_poses_world) != 1:
+        raise NotImplementedError(
+            "The backend currently supports exactly one anchor pose variable; "
+            f"got {sorted(anchor_poses_world)}"
+        )
+    anchor_key_by_tag = {
+        tid: gtsam.symbol('A', tid) for tid in anchor_poses_world
+    }
+
     # Priors: match old solver (bias prior + optional td prior; no X0/V0 prior).
     bias_prior_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([2e-2, 2e-2, 2e-2, 1e-3, 1e-3, 1e-3]))
     graph.add(gtsam.PriorFactorConstantBias(sym.B(0), _bias(gyro_correction @ bg[0], accel_correction @ ba[0]), bias_prior_noise))
@@ -373,6 +427,15 @@ def run_batch_vio_optimization(
         td_sigma = max(float(time_offset_prior_s), 1e-6)
         graph.add(gtsam.PriorFactorVector(TD_KEY, np.array([td_init], dtype=np.float64), gtsam.noiseModel.Isotropic.Sigma(1, td_sigma)))
         values.insert(TD_KEY, np.array([td_init], dtype=np.float64))
+
+    # Anchor variable in the gravity-aligned GTSAM frame.
+    for tid, T_w0_a in anchor_poses_world.items():
+        T_g_a = np.eye(4, dtype=np.float64)
+        T_g_a[:3, :3] = R_align_init @ T_w0_a[:3, :3]
+        T_g_a[:3, 3] = R_align_init @ T_w0_a[:3, 3]
+        akey = anchor_key_by_tag[tid]
+        values.insert(akey, _pose3(T_g_a[:3, :3], T_g_a[:3, 3]))
+        graph.add(gtsam.PriorFactorPose3(akey, _pose3(T_g_a[:3, :3], T_g_a[:3, 3]), _anchor_gauge_noise(T_g_a)))
 
     # Store biases in corrected space in the GTSAM graph: b_corr = C * b_raw.
     for k in range(N):
@@ -419,14 +482,20 @@ def run_batch_vio_optimization(
                 T_aligned[:3, 3] = R_align_init @ T_wi_init[:3, 3]
                 graph.add(gtsam.PriorFactorPose3(sym.X(ki), _pose3(T_aligned[:3, :3], T_aligned[:3, 3]), prior_noise))
 
-    # Anchor factors (fixed world points)
+    # Anchor factors. Corners stay in the tag frame; the solver estimates the
+    # tag pose instead of treating it as a fixed world point.
     anc = anchor_packed
     for i in range(len(anc["frame_idx"])):
         k = int(anc["frame_idx"][i])
+        tid = int(anc["tag_ids"][i])
         uv = anc["uv_meas"][i].astype(np.float64)
-        Xw = (R_align_init @ anc["pts_world"][i].astype(np.float64))
+        X_local = anc["pts_local"][i].astype(np.float64)
         om_unb = gyro_correction @ (omega_raw[k] - bg[k]) if gyro_correction is not None else (omega_raw[k] - bg[k])
-        graph.add(_visual_factor(sym.X(k), sym.V(k), None, td_key_opt, uv, Xw, cam1, om_unb, td_init, anchor_sigma_px, anchor_huber_delta_px, 0.0))
+        graph.add(_visual_factor(
+            sym.X(k), sym.V(k), None, td_key_opt, anchor_key_by_tag[tid],
+            uv, X_local, cam1, om_unb, td_init,
+            anchor_sigma_px, anchor_huber_delta_px, 0.0,
+        ))
 
     # KLT factors
     klt = klt_packed
@@ -435,7 +504,11 @@ def run_batch_vio_optimization(
         j = int(klt["lm_idx"][i])
         uv = klt["uv_meas"][i].astype(np.float64)
         om_unb = gyro_correction @ (omega_raw[k] - bg[k]) if gyro_correction is not None else (omega_raw[k] - bg[k])
-        graph.add(_visual_factor(sym.X(k), sym.V(k), sym.L(j), td_key_opt, uv, None, cam1, om_unb, td_init, klt_sigma_px, huber_delta_px, klt_omega_rate_scale))
+        graph.add(_visual_factor(
+            sym.X(k), sym.V(k), sym.L(j), td_key_opt, None,
+            uv, None, cam1, om_unb, td_init,
+            klt_sigma_px, huber_delta_px, klt_omega_rate_scale,
+        ))
 
     # Optimize
     lm_params = gtsam.LevenbergMarquardtParams()
@@ -488,6 +561,13 @@ def run_batch_vio_optimization(
     T_world_imu = T_align[None, :, :] @ T_world_imu
     T_world_cam1 = T_align[None, :, :] @ T_world_cam1
 
+    # Optimized anchor poses are already expressed in the final gravity-aligned
+    # world frame used by T_world_imu / T_world_cam1 above.
+    anchor_poses_out = {
+        tid: np.asarray(result.atPose3(akey).matrix(), dtype=np.float64).copy()
+        for tid, akey in anchor_key_by_tag.items()
+    }
+
     return {
         "t_cam1": np.asarray(vio_data["t_cam1"], dtype=np.float64),
         "T_world_imu": T_world_imu,
@@ -500,4 +580,7 @@ def run_batch_vio_optimization(
         "R_gravity_align": R_align,
         "td_cam_imu": float(td),
         "rolling_shutter_readout_s": float(cam1.get("rolling_shutter_readout_s") or 0.0),
+        # Single-anchor run: keep this a plain numeric array so np.savez/np.load
+        # with allow_pickle=False keeps working.
+        "T_world_tag": next(iter(anchor_poses_out.values())),
     }

@@ -1,10 +1,18 @@
-# Core dependencies for OM-TagVINS
-numpy>=1.24,<3
-scipy>=1.10,<2
-opencv-python>=4.8,<5
-PyYAML>=6.0,<7
-rerun-sdk>=0.37,<0.38
-pupil-apriltags>=1.0.4,<2
-pandas>=2,<3
-telemetry-parser>=0.4
-gtsam>=4.2,<5
+[workspace]
+name = "OM-TagVINS"
+channels = ["conda-forge"]
+platforms = ["win-64", "linux-64", "osx-arm64"]
+
+[dependencies]
+python = "3.12.*"
+gtsam = ">=4.2,<5"
+opencv = ">=4.8,<5"
+
+[pypi-dependencies]
+numpy = ">=1.24,<3"
+scipy = ">=1.10,<2"
+PyYAML = ">=6.0,<7"
+rerun-sdk = { version = ">=0.37,<0.38", extras = ["catalog"] }
+pupil-apriltags = ">=1.0.4,<2"
+pandas = ">=2,<3"
+telemetry-parser = ">=0.4"
