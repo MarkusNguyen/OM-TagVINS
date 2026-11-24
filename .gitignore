@@ -1,6 +1,10 @@
 *.insv
 *.rrd
 *.npz
-# pixi environments
-.pixi/*
-!.pixi/config.toml
+
+# uv environments
+.venv/
+
+# Python caches
+__pycache__/
+*.pyc

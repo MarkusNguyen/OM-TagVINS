@@ -14,26 +14,46 @@ DEFAULT_RUN_CONFIG = {
         "size_m": 0.100,
     },
     "frontend": {
-        "max_corners_per_cam": 220,
-        "min_track_len": 5,
-        "min_parallax_deg": 0.15,
+        # Specialist-matched defaults. These are significantly heavier than
+        # the previous runtime-tuned values (220 / 5 / 90 / 24).
+        "max_corners_per_cam": 4000,
+        "min_track_len": 3,
+        "min_parallax_deg": 0.5,
+        # Dead KLT tracks are still retired instead of growing one Python list
+        # per observation forever. Specialist counts track span in keyframes;
+        # this repo applies the same numeric cap to frame observations.
+        "max_track_len": 300,
+        "max_triangulation_obs": 8,
+        # AprilTag detection on every full-resolution frame dominates runtime.
+        # Detect on a downscaled image every N-th frame, then refine corners on
+        # the full-resolution image.
+        "tag_detect_stride": 1,
+        "tag_detect_scale": 0.5,
     },
     "optimizer": {
-        "max_iters": 40,
-        "anchor_sigma_px": 0.5,
-        "klt_sigma_px": 0.40,
-        "anchor_huber_px": 10.0,
-        "klt_huber_px": 2.5,
+        # Specialist SolverCfg.max_iterations.
+        "max_iters": 30,
+        # Batch-graph size controls. Initialization still uses every anchor
+        # sighting; only the optimizer's factor set is subsampled.
+        "anchor_factor_stride": 4,
+        "max_klt_obs_per_landmark": 30,
+        # Optimize on every N-th camera frame and interpolate the full-rate
+        # output. Front-end detection and trajectory export remain full rate.
+        "backend_frame_stride": 2,
+        "anchor_sigma_px": 1.05,
+        "klt_sigma_px": 0.5,
+        "anchor_huber_px": 1.41,
+        "klt_huber_px": 0.67,
         "init_prior_rot": 0.0,
         "init_prior_trans": 0.0,
         # Inflate KLT sigma/Huber by (1 + scale * ||omega|| [rad/s]) during
         # fast rotation to reduce motion-blur / high-rate coupling influence.
-        "klt_omega_rate_scale": 0.15,
+        "klt_omega_rate_scale": 0.0,
         # Rolling-shutter readout in seconds. None uses the value logged by
         # converter.py from the .insv telemetry; 0 disables compensation.
         "rolling_shutter_readout_s": None,
         # Online estimation of the camera-minus-IMU timing offset.
-        "estimate_time_offset": True,
+        "estimate_time_offset": False,
         "time_offset_prior_s": 0.005,
     },
 }

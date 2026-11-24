@@ -1,5 +1,7 @@
 import warnings
 
+import pandas as pd
+import pyarrow as pa
 import yaml
 import cv2
 import numpy as np
@@ -131,6 +133,69 @@ def _decode_image_cell(cell) -> np.ndarray:
     raise ValueError(f"Unexpected image cell shape={arr.shape}, dtype={arr.dtype}")
 
 
+def _arrow_timeline_to_seconds(column) -> np.ndarray:
+    """Converts a Rerun Arrow timeline column to seconds without pandas expansion."""
+    array = column.combine_chunks() if hasattr(column, "combine_chunks") else column
+    if pa.types.is_duration(array.type) or pa.types.is_timestamp(array.type):
+        nanos = array.cast(pa.int64()).to_numpy(zero_copy_only=False).astype(np.float64)
+        return nanos * 1e-9
+    return _timeline_to_seconds(pd.Series(array.to_pandas()))
+
+
+def _arrow_blob_column_to_bytes(column) -> list[np.ndarray | bytes | None]:
+    """Extracts encoded image blobs from a nested Rerun Arrow column.
+
+    Rerun stores blob components as ``list<list<uint8>>``. Converting that to
+    pandas creates one Python object per byte, which needs gigabytes of RAM for
+    long recordings. Reading the underlying uint8 buffer keeps only the encoded
+    JPEG bytes until an image is actually requested by ``LazyImageSequence``.
+    """
+    array = column.combine_chunks() if hasattr(column, "combine_chunks") else column
+
+    if pa.types.is_binary(array.type) or pa.types.is_large_binary(array.type):
+        return [value.as_py() for value in array]
+
+    if (
+        pa.types.is_list(array.type)
+        and pa.types.is_list(array.values.type)
+        and pa.types.is_unsigned_integer(array.values.values.type)
+    ):
+        inner = array.values
+        byte_array = inner.values
+        buffer = byte_array.buffers()[1]
+        raw = np.frombuffer(
+            buffer,
+            dtype=byte_array.type.to_pandas_dtype(),
+            count=len(byte_array),
+            offset=byte_array.offset,
+        )
+        outer_offsets = array.offsets.to_numpy(zero_copy_only=False)
+        inner_offsets = inner.offsets.to_numpy(zero_copy_only=False)
+        is_null = array.is_null().to_numpy(zero_copy_only=False)
+        blobs: list[np.ndarray | None] = []
+        for i in range(len(array)):
+            if bool(is_null[i]):
+                blobs.append(None)
+                continue
+            outer_start, outer_end = int(outer_offsets[i]), int(outer_offsets[i + 1])
+            if outer_start == outer_end:
+                blobs.append(None)
+                continue
+            start, end = int(inner_offsets[outer_start]), int(inner_offsets[outer_end])
+            blobs.append(raw[start:end])
+        return blobs
+
+    # Fallback for future component layouts: still avoids materializing pandas.
+    blobs = []
+    for value in array:
+        py_value = value.as_py()
+        if py_value is None:
+            blobs.append(None)
+        else:
+            blobs.append(np.asarray(py_value, dtype=np.uint8).reshape(-1))
+    return blobs
+
+
 class LazyImageSequence:
     """Decodes Rerun image blobs on demand so all frames are never held in RAM."""
 
@@ -242,23 +307,52 @@ def load_base_rrd(rrd_path: str, timeline: str = "time") -> dict:
         accel_raw = np.column_stack([_col("/imu/accel/x"), _col("/imu/accel/y"), _col("/imu/accel/z")])
         gyro_raw  = np.column_stack([_col("/imu/gyro/x"),  _col("/imu/gyro/y"),  _col("/imu/gyro/z")])
 
-        # 2. Query the rear camera stream only.
-        cam_df = (
-            dataset.filter_contents(["/camera/rear"])
-            .reader(index=timeline)
-            .to_pandas()
-            .sort_values(timeline)
-        )
+        # 2. Query the rear camera stream only. Stream Arrow batches instead of
+        # materializing the whole camera table as pandas: the nested blob column
+        # expands to billions of Python ints and can require >3 GB of RAM.
+        cam_stream = dataset.filter_contents(["/camera/rear"]).reader(index=timeline)
+        blob_col = None
+        t_cam_parts: list[np.ndarray] = []
+        rear_cells: list[np.ndarray | bytes | None] = []
+        for batch in cam_stream.execute_stream():
+            record = batch.to_pyarrow()
+            if blob_col is None:
+                blob_col = next(
+                    (
+                        name
+                        for name in record.schema.names
+                        if name.startswith("/camera/rear:") and name.endswith(":blob")
+                    ),
+                    None,
+                )
+                if blob_col is None:
+                    raise ValueError(f"No rear-camera blob column found in {rrd_path}")
+            if timeline not in record.schema.names:
+                continue
+            t_cam_parts.append(_arrow_timeline_to_seconds(record.column(timeline)))
+            rear_cells.extend(_arrow_blob_column_to_bytes(record.column(blob_col)))
 
-        rear_col = [c for c in cam_df.columns if c.startswith("/camera/rear:")][0]
-        cam_df = cam_df.dropna(subset=[rear_col])
-        if cam_df.empty:
+        if not rear_cells:
             raise ValueError(f"No rear-camera frames found in {rrd_path}")
 
-        t_cam_raw = _timeline_to_seconds(cam_df[timeline])
+        t_cam_raw = np.concatenate(t_cam_parts)
+        if len(t_cam_raw) != len(rear_cells):
+            raise ValueError(
+                f"Camera timestamp/blob count mismatch: {len(t_cam_raw)} vs {len(rear_cells)}"
+            )
+
+        valid = np.array(
+            [cell is not None and len(np.asarray(cell).reshape(-1)) > 0 for cell in rear_cells],
+            dtype=bool,
+        )
+        t_cam_raw = t_cam_raw[valid]
+        rear_cells = [cell for cell, ok in zip(rear_cells, valid) if ok]
+        order = np.argsort(t_cam_raw)
+        t_cam_raw = t_cam_raw[order]
+        rear_cells = [rear_cells[int(i)] for i in order]
 
         # Keep encoded blobs (cheap) and decode frames lazily on access.
-        rear_imgs = LazyImageSequence(cam_df[rear_col].tolist())
+        rear_imgs = LazyImageSequence(rear_cells)
 
         # 3. Optional rolling-shutter readout stored by converter.py from the
         # Insta360 .insv telemetry (specialist-style metadata extraction).

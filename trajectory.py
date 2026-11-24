@@ -259,6 +259,10 @@ def run_vio_via_optimize(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarr
             max_corners_per_cam=args.max_corners_per_cam,
             min_track_len=args.min_track_len,
             min_parallax_deg=args.min_parallax_deg,
+            max_track_len=args.max_track_len,
+            max_triangulation_obs=args.max_triangulation_obs,
+            tag_detect_stride=args.tag_detect_stride,
+            tag_detect_scale=args.tag_detect_scale,
             max_iters=args.max_iters,
             anchor_sigma=args.anchor_sigma,
             klt_sigma=args.klt_sigma,
@@ -270,6 +274,9 @@ def run_vio_via_optimize(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarr
             rolling_shutter_readout_s=args.rolling_shutter_readout_s,
             estimate_time_offset=args.estimate_time_offset,
             time_offset_prior_s=args.time_offset_prior_s,
+            anchor_factor_stride=args.anchor_factor_stride,
+            max_klt_obs_per_landmark=args.max_klt_obs_per_landmark,
+            backend_frame_stride=args.backend_frame_stride,
         )
         return load_trajectory(vio_npz)
 
@@ -358,6 +365,30 @@ def parse_args() -> argparse.Namespace:
         help="Minimum KLT bearing parallax for triangulation (degrees)",
     )
     vio.add_argument(
+        "--max-track-len",
+        type=int,
+        default=cfg["frontend"]["max_track_len"],
+        help="Maximum observations retained per KLT track (runtime guard)",
+    )
+    vio.add_argument(
+        "--max-triangulation-obs",
+        type=int,
+        default=cfg["frontend"]["max_triangulation_obs"],
+        help="Maximum observations sampled per track during triangulation",
+    )
+    vio.add_argument(
+        "--tag-detect-stride",
+        type=int,
+        default=cfg["frontend"]["tag_detect_stride"],
+        help="Run full AprilTag detection every N-th frame",
+    )
+    vio.add_argument(
+        "--tag-detect-scale",
+        type=float,
+        default=cfg["frontend"]["tag_detect_scale"],
+        help="Scale factor for AprilTag detection image (corners are refined at full resolution)",
+    )
+    vio.add_argument(
         "--max-iters",
         type=int,
         default=cfg["optimizer"]["max_iters"],
@@ -420,7 +451,7 @@ def parse_args() -> argparse.Namespace:
         dest="estimate_time_offset",
         action="store_true",
         default=cfg["optimizer"]["estimate_time_offset"],
-        help="Estimate the camera-minus-IMU time offset (default: enabled)",
+        help="Estimate the camera-minus-IMU time offset (default: from VIO config)",
     )
     timing.add_argument(
         "--no-estimate-time-offset",
@@ -433,6 +464,27 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=cfg["optimizer"]["time_offset_prior_s"],
         help="Prior sigma on the estimated camera-minus-IMU time offset (s)",
+    )
+    vio.add_argument(
+        "--anchor-factor-stride",
+        type=int,
+        default=cfg["optimizer"]["anchor_factor_stride"],
+        help="Add anchor gauge factors only every N-th detection frame",
+    )
+    vio.add_argument(
+        "--max-klt-obs-per-landmark",
+        type=int,
+        default=cfg["optimizer"]["max_klt_obs_per_landmark"],
+        help="Maximum KLT observations per landmark added to the batch graph",
+    )
+    vio.add_argument(
+        "--backend-frame-stride",
+        type=int,
+        default=cfg["optimizer"]["backend_frame_stride"],
+        help=(
+            "Optimize every N-th camera frame and interpolate the trajectory "
+            "output (keep at 2; larger values can destabilize LM)"
+        ),
     )
 
     return parser.parse_args()

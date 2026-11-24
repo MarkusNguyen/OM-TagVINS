@@ -5,6 +5,7 @@ them together and exposes ``run_vio``.  The imported helper names are kept in
 scope as a convenience for callers that previously imported them from here.
 """
 
+import time
 from pathlib import Path
 
 import numpy as np
@@ -45,6 +46,10 @@ def run_vio(
     max_corners_per_cam: int | None = None,
     min_track_len: int | None = None,
     min_parallax_deg: float | None = None,
+    max_track_len: int | None = None,
+    max_triangulation_obs: int | None = None,
+    tag_detect_stride: int | None = None,
+    tag_detect_scale: float | None = None,
     max_iters: int | None = None,
     anchor_sigma: float | None = None,
     klt_sigma: float | None = None,
@@ -56,6 +61,9 @@ def run_vio(
     rolling_shutter_readout_s: float | None = None,
     estimate_time_offset: bool | None = None,
     time_offset_prior_s: float | None = None,
+    anchor_factor_stride: int | None = None,
+    max_klt_obs_per_landmark: int | None = None,
+    backend_frame_stride: int | None = None,
 ) -> dict:
     """Run full-batch IMU-aided VIO on a base .rrd recording.
 
@@ -74,6 +82,14 @@ def run_vio(
         min_track_len = cfg["frontend"]["min_track_len"]
     if min_parallax_deg is None:
         min_parallax_deg = cfg["frontend"]["min_parallax_deg"]
+    if max_track_len is None:
+        max_track_len = cfg["frontend"]["max_track_len"]
+    if max_triangulation_obs is None:
+        max_triangulation_obs = cfg["frontend"]["max_triangulation_obs"]
+    if tag_detect_stride is None:
+        tag_detect_stride = cfg["frontend"]["tag_detect_stride"]
+    if tag_detect_scale is None:
+        tag_detect_scale = cfg["frontend"]["tag_detect_scale"]
     if max_iters is None:
         max_iters = cfg["optimizer"]["max_iters"]
     if anchor_sigma is None:
@@ -96,6 +112,13 @@ def run_vio(
         estimate_time_offset = cfg["optimizer"]["estimate_time_offset"]
     if time_offset_prior_s is None:
         time_offset_prior_s = cfg["optimizer"]["time_offset_prior_s"]
+    if anchor_factor_stride is None:
+        anchor_factor_stride = cfg["optimizer"]["anchor_factor_stride"]
+    if max_klt_obs_per_landmark is None:
+        max_klt_obs_per_landmark = cfg["optimizer"]["max_klt_obs_per_landmark"]
+    if backend_frame_stride is None:
+        backend_frame_stride = cfg["optimizer"]["backend_frame_stride"]
+    backend_frame_stride = max(1, int(backend_frame_stride))
 
     print(f"VIO config: {config}")
 
@@ -106,7 +129,13 @@ def run_vio(
     if viz is None:
         viz = str(Path("logs/estimate") / f"{rrd_stem}_vio.rrd")
 
+    t_stage = time.perf_counter()
     vio_data = prepare_vio_inputs(rrd, calib)
+    print(
+        f"Prepared VIO inputs in {time.perf_counter() - t_stage:.2f}s "
+        f"({len(vio_data['t_cam1'])} frames)",
+        flush=True,
+    )
 
     # Explicit config/CLI readout overrides the metadata logged by converter.py.
     if rolling_shutter_readout_s is not None:
@@ -128,12 +157,23 @@ def run_vio(
         }
     }
 
+    t_stage = time.perf_counter()
     visual_meas = extract_visual_measurements(
         vio_data,
         anchor_tags=anchor_tags,
         max_corners_per_cam=max_corners_per_cam,
         min_track_len=min_track_len,
         min_parallax_deg=min_parallax_deg,
+        max_track_len=max_track_len,
+        max_triangulation_obs=max_triangulation_obs,
+        tag_detect_stride=tag_detect_stride,
+        tag_detect_scale=tag_detect_scale,
+    )
+    print(
+        f"Visual front end finished in {time.perf_counter() - t_stage:.2f}s "
+        f"(anchor={len(visual_meas['anchor_obs'])} "
+        f"landmarks={len(visual_meas['landmarks_world'].get('cam1', {}))})",
+        flush=True,
     )
 
     opt_res = run_batch_vio_optimization(
@@ -149,6 +189,13 @@ def run_vio(
         klt_omega_rate_scale=klt_omega_rate_scale,
         estimate_time_offset=bool(estimate_time_offset),
         time_offset_prior_s=float(time_offset_prior_s),
+        anchor_factor_stride=int(anchor_factor_stride),
+        max_klt_obs_per_landmark=(
+            int(max_klt_obs_per_landmark)
+            if max_klt_obs_per_landmark is not None
+            else None
+        ),
+        backend_frame_stride=int(backend_frame_stride),
     )
 
     Path(out_npz).parent.mkdir(parents=True, exist_ok=True)

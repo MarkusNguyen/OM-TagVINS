@@ -44,6 +44,7 @@ def triangulate_klt_tracks(
     cams: dict,
     min_parallax_deg: float = 0.5,
     max_reproj_px: float = 3.0,
+    max_obs_per_track: int | None = None,
 ) -> dict:
     """Triangulates initial 3D world coordinates for rear-camera KLT tracks."""
     landmarks_world = {cam_name: {} for cam_name in ACTIVE_CAMS}
@@ -54,9 +55,34 @@ def triangulate_klt_tracks(
         T_cam_imu = cam["T_cam_imu"]
 
         for tid, obs_list in klt_tracks[cam_name].items():
-            posed_obs = [
-                (f_idx, uv, ray) for (f_idx, uv, ray) in obs_list if f_idx in init_poses_world_imu
-            ]
+            posed_obs = []
+            for obs in obs_list:
+                f_idx = int(obs[0])
+                if f_idx not in init_poses_world_imu:
+                    continue
+                if len(obs) == 6:
+                    # Compact observation from IMUAidedFisheyeKLTTracker.
+                    uv = (obs[1], obs[2])
+                    ray = (obs[3], obs[4], obs[5])
+                else:
+                    uv, ray = obs[1], obs[2]
+                posed_obs.append(
+                    (
+                        f_idx,
+                        np.asarray(uv, dtype=np.float64),
+                        np.asarray(ray, dtype=np.float64),
+                    )
+                )
+            if len(posed_obs) < 3:
+                continue
+
+            # A long track can contain thousands of nearly redundant rays. Their
+            # DLT system adds little information but costs a lot of SVD time.
+            if max_obs_per_track and len(posed_obs) > int(max_obs_per_track):
+                sample_idx = np.linspace(
+                    0, len(posed_obs) - 1, int(max_obs_per_track), dtype=np.int64
+                )
+                posed_obs = [posed_obs[int(i)] for i in sample_idx]
             if len(posed_obs) < 3:
                 continue
 

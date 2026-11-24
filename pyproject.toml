@@ -1,0 +1,21 @@
+[project]
+name = "om-tagvins"
+version = "0.1.0"
+description = "Rear-camera visual-inertial odometry with a stationary AprilTag anchor"
+authors = [{ name = "MarkusNguyen", email = "11525061@student.vgu.edu.vn" }]
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "numpy>=1.24,<3",
+    "scipy>=1.10,<2",
+    "opencv-python>=4.8,<5",
+    "PyYAML>=6.0,<7",
+    "rerun-sdk[catalog]>=0.37.2,<0.38",
+    "pupil-apriltags>=1.0.4,<2",
+    "pandas>=2,<3",
+    "telemetry-parser>=0.4",
+    "gtsam>=4.2,<5",
+]
+
+# This repository is a set of runnable scripts, not an installable Python package.
+[tool.uv]
+package = false

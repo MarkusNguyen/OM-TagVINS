@@ -33,9 +33,13 @@ from src.frontend.triangulation import triangulate_klt_tracks
 def extract_visual_measurements(
     vio_data: dict,
     anchor_tags: dict,
-    max_corners_per_cam: int = 220,
-    min_track_len: int = 5,
-    min_parallax_deg: float = 0.15,
+    max_corners_per_cam: int = 4000,
+    min_track_len: int = 3,
+    min_parallax_deg: float = 0.5,
+    max_track_len: int = 300,
+    max_triangulation_obs: int = 8,
+    tag_detect_stride: int = 1,
+    tag_detect_scale: float = 0.5,
 ) -> dict:
     """
     Runs stationary anchor AprilTag detection and IMU-aided fisheye KLT tracking
@@ -49,11 +53,18 @@ def extract_visual_measurements(
 
     detector = Detector(families="tag36h11", nthreads=4, quad_decimate=1.0, refine_edges=1)
 
+    detect_stride = max(1, int(tag_detect_stride))
+    detect_scale = float(tag_detect_scale)
+    if not np.isfinite(detect_scale) or not 0.0 < detect_scale <= 1.0:
+        raise ValueError(f"tag_detect_scale must be in (0, 1], got {detect_scale}")
+
     trackers = {
         cam_name: IMUAidedFisheyeKLTTracker(
             cams[cam_name],
             build_static_masks(cams[cam_name], cam_name),
             max_corners_per_cam,
+            min_track_len=min_track_len,
+            max_track_len=max_track_len,
         )
         for cam_name in ACTIVE_CAMS
     }
@@ -96,15 +107,36 @@ def extract_visual_measurements(
                 omega_unb = gyro_correction @ (omega_node - b_gyro_0)
 
             gray_rear = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-            dets = detector.detect(gray_rear)
+
+            # Full-resolution AprilTag detection is the single largest frontend
+            # cost on long recordings. Detect on a downscaled image every
+            # `detect_stride` frames, then refine against the full-resolution
+            # image so the stored corner accuracy is unchanged.
+            if k % detect_stride == 0:
+                if detect_scale < 1.0:
+                    detect_gray = cv2.resize(
+                        gray_rear,
+                        None,
+                        fx=detect_scale,
+                        fy=detect_scale,
+                        interpolation=cv2.INTER_AREA,
+                    )
+                else:
+                    detect_gray = gray_rear
+                dets = detector.detect(detect_gray)
+            else:
+                dets = ()
 
             for det in dets:
                 tid = int(det.tag_id)
                 if tid not in anchor_tags:
                     continue
 
+                rough_corners = np.asarray(det.corners, dtype=np.float64)
+                if detect_scale < 1.0:
+                    rough_corners = rough_corners / detect_scale
                 corners_uv = refine_tag_corners_virtual_pinhole(
-                    gray_rear, np.asarray(det.corners, dtype=np.float64), det.tag_id, cam1, detector
+                    gray_rear, rough_corners, tid, cam1, detector
                 )
                 info = anchor_tags[tid]
                 rays = unproject_kannala_brandt(corners_uv, cam)
@@ -154,16 +186,20 @@ def extract_visual_measurements(
             "sighting; cannot initialize VIO poses."
         )
 
-    klt_tracks = {
-        cam_name: {tid: obs for tid, obs in trk.tracks.items() if len(obs) >= min_track_len}
-        for cam_name, trk in trackers.items()
-    }
+    klt_tracks = {}
+    for cam_name, trk in trackers.items():
+        merged = dict(trk.finished_tracks)
+        merged.update(
+            {tid: obs for tid, obs in trk.tracks.items() if len(obs) >= min_track_len}
+        )
+        klt_tracks[cam_name] = merged
 
     landmarks_world = triangulate_klt_tracks(
         klt_tracks,
         init_poses_world_imu,
         cams,
         min_parallax_deg=min_parallax_deg,
+        max_obs_per_track=max_triangulation_obs,
     )
 
     return {
@@ -190,6 +226,10 @@ def run_frontend(
     max_corners_per_cam: int | None = None,
     min_track_len: int | None = None,
     min_parallax_deg: float | None = None,
+    max_track_len: int | None = None,
+    max_triangulation_obs: int | None = None,
+    tag_detect_stride: int | None = None,
+    tag_detect_scale: float | None = None,
 ) -> dict:
     """Run the rear-camera visual front-end on a base .rrd recording.
 
@@ -208,6 +248,14 @@ def run_frontend(
         min_track_len = cfg["frontend"]["min_track_len"]
     if min_parallax_deg is None:
         min_parallax_deg = cfg["frontend"]["min_parallax_deg"]
+    if max_track_len is None:
+        max_track_len = cfg["frontend"]["max_track_len"]
+    if max_triangulation_obs is None:
+        max_triangulation_obs = cfg["frontend"]["max_triangulation_obs"]
+    if tag_detect_stride is None:
+        tag_detect_stride = cfg["frontend"]["tag_detect_stride"]
+    if tag_detect_scale is None:
+        tag_detect_scale = cfg["frontend"]["tag_detect_scale"]
 
     print(f"VIO config: {config}")
 
@@ -226,6 +274,10 @@ def run_frontend(
         max_corners_per_cam=max_corners_per_cam,
         min_track_len=min_track_len,
         min_parallax_deg=min_parallax_deg,
+        max_track_len=max_track_len,
+        max_triangulation_obs=max_triangulation_obs,
+        tag_detect_stride=tag_detect_stride,
+        tag_detect_scale=tag_detect_scale,
     )
 
     print(f"Frames processed:        {len(vio_data['t_cam1'])}")

@@ -5,7 +5,10 @@ for the pipeline entry points that call these helpers.
 """
 
 import numpy as np
+from scipy.sparse import coo_matrix
+from scipy.sparse.linalg import lsqr
 
+from ..core.lie_algebra import so3_exp, so3_log
 from .imu_preintegration import PreintegratedIMUFactor
 
 
@@ -123,12 +126,27 @@ def refine_initial_velocities(
         return v_init.copy()
 
     I3 = np.eye(3, dtype=np.float64)
-    rows, rhs = [], []
+    n_unknown = 3 * N
+    row_indices: list[int] = []
+    col_indices: list[int] = []
+    values: list[float] = []
+    rhs: list[float] = []
+    next_row = 0
 
-    def frame_row(k: int, value: np.ndarray) -> np.ndarray:
-        row = np.zeros((3, 3 * N), dtype=np.float64)
-        row[:, 3 * k : 3 * k + 3] = value
-        return row
+    def add_block_row(blocks, rhs_vec):
+        """Appends one 3-row block equation; each entry is (frame_index, 3x3 block)."""
+        nonlocal next_row
+        for frame_idx, block in blocks:
+            for a in range(3):
+                for b in range(3):
+                    value = float(block[a, b])
+                    if value == 0.0:
+                        continue
+                    row_indices.append(next_row + a)
+                    col_indices.append(3 * frame_idx + b)
+                    values.append(value)
+        rhs.extend(float(v) for v in rhs_vec)
+        next_row += 3
 
     for k in range(N - 1):
         pf = preint_factors[k]
@@ -138,23 +156,22 @@ def refine_initial_velocities(
         b_pos = (
             p_wi[k + 1] - p_wi[k] - 0.5 * g_world * (dt * dt) - Rk @ pf.dp
         ) / dt
-        rows.append(frame_row(k, I3))
-        rhs.append(b_pos)
-
-        row = np.zeros((3, 3 * N), dtype=np.float64)
-        row[:, 3 * k : 3 * k + 3] = -I3
-        row[:, 3 * (k + 1) : 3 * (k + 1) + 3] = I3
-        rows.append(row)
-        rhs.append(g_world * dt + Rk @ pf.dv)
+        add_block_row([(k, I3)], b_pos)
+        add_block_row([(k, -I3), (k + 1, I3)], g_world * dt + Rk @ pf.dv)
 
     # Weak prior towards central differences (guards against degenerate motion).
     for k in range(N):
-        rows.append(frame_row(k, 0.1 * I3))
-        rhs.append(0.1 * v_init[k])
+        add_block_row([(k, 0.1 * I3)], 0.1 * v_init[k])
 
-    A = np.vstack(rows)
-    b = np.concatenate(rhs)
-    v_sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+    # The dense equivalent is (3N x 3N) and needs several GB for long recordings.
+    # Every row has only 3 or 6 nonzeros, so keep it sparse and solve with LSQR.
+    A = coo_matrix(
+        (values, (row_indices, col_indices)),
+        shape=(next_row, n_unknown),
+        dtype=np.float64,
+    ).tocsr()
+    b = np.asarray(rhs, dtype=np.float64)
+    v_sol = lsqr(A, b, atol=1e-10, btol=1e-10, iter_lim=5000)[0]
     return v_sol.reshape(N, 3)
 
 
@@ -171,13 +188,130 @@ def extract_frame_gyros(vio_data: dict) -> np.ndarray:
     return omega_raw
 
 
-def pack_visual_observations(visual_meas: dict, tid_to_lm_idx: dict):
+def _merge_imu_intervals(intervals: list[dict], start: int, end: int) -> dict:
+    """Merges consecutive IMU intervals into one interval spanning two kept frames."""
+    if end <= start + 1:
+        return intervals[start]
+
+    timestamps, accel, gyro = [], [], []
+    for idx in range(start, end):
+        segment = intervals[idx]
+        skip = 0 if idx == start else 1  # adjacent intervals share one endpoint
+        timestamps.extend(segment["timestamps"][skip:])
+        accel.extend(segment["accel"][skip:])
+        gyro.extend(segment["gyro"][skip:])
+    times = np.asarray(timestamps, dtype=np.float64)
+    return {
+        "t0": float(times[0]),
+        "t1": float(times[-1]),
+        "timestamps": times,
+        "dt": np.diff(times),
+        "accel": np.asarray(accel, dtype=np.float64),
+        "gyro": np.asarray(gyro, dtype=np.float64),
+    }
+
+
+def downsample_backend_frames(vio_data: dict, visual_meas: dict, stride: int):
+    """Builds a smaller backend problem by keeping every N-th camera frame.
+
+    Front-end outputs stay at full rate; only the batch optimizer uses the
+    reduced state. Frame indices in the measurements are remapped accordingly.
+    """
+    stride = max(1, int(stride))
+    t_cam1 = np.asarray(vio_data["t_cam1"], dtype=np.float64)
+    n_frames = len(t_cam1)
+    if stride == 1 or n_frames < 3:
+        return (
+            vio_data,
+            visual_meas,
+            t_cam1,
+            t_cam1,
+            np.arange(n_frames, dtype=np.int64),
+        )
+
+    kept = np.arange(0, n_frames, stride, dtype=np.int64)
+    if kept[-1] != n_frames - 1:
+        kept = np.append(kept, n_frames - 1)
+    old_to_new = {int(old): int(new) for new, old in enumerate(kept)}
+
+    new_vio = dict(vio_data)
+    new_vio["t_cam1"] = t_cam1[kept]
+    new_vio["imu_intervals_cam1"] = [
+        _merge_imu_intervals(vio_data["imu_intervals_cam1"], int(kept[i]), int(kept[i + 1]))
+        for i in range(len(kept) - 1)
+    ]
+
+    new_anchor_obs = []
+    for obs in visual_meas["anchor_obs"]:
+        new_idx = old_to_new.get(int(obs["frame_idx"]))
+        if new_idx is None:
+            continue
+        remapped = dict(obs)
+        remapped["frame_idx"] = new_idx
+        new_anchor_obs.append(remapped)
+
+    new_init_poses = {}
+    for frame_idx, pose in visual_meas["init_poses_world_imu"].items():
+        new_idx = old_to_new.get(int(frame_idx))
+        if new_idx is not None:
+            new_init_poses[new_idx] = pose
+
+    new_tracks = {}
+    for cam_name, tracks in visual_meas["klt_tracks"].items():
+        new_tracks[cam_name] = {}
+        for tid, obs_list in tracks.items():
+            remapped_obs = []
+            for obs in obs_list:
+                new_idx = old_to_new.get(int(obs[0]))
+                if new_idx is None:
+                    continue
+                if len(obs) == 6:
+                    remapped_obs.append((new_idx, obs[1], obs[2], obs[3], obs[4], obs[5]))
+                else:
+                    remapped_obs.append((new_idx, obs[1], obs[2]))
+            if remapped_obs:
+                new_tracks[cam_name][tid] = remapped_obs
+
+    # Drop landmarks that no longer have any observation in the reduced graph;
+    # otherwise GTSAM would insert unconstrained Point3 variables.
+    lm_by_cam = {
+        cam: dict(landmarks)
+        for cam, landmarks in visual_meas.get("landmarks_world", {}).items()
+    }
+    referenced = set(new_tracks.get("cam1", {}))
+    if "cam1" in lm_by_cam:
+        lm_by_cam["cam1"] = {
+            tid: xyz for tid, xyz in lm_by_cam["cam1"].items() if tid in referenced
+        }
+
+    new_visual = dict(visual_meas)
+    new_visual["anchor_obs"] = new_anchor_obs
+    new_visual["init_poses_world_imu"] = new_init_poses
+    new_visual["klt_tracks"] = new_tracks
+    new_visual["landmarks_world"] = lm_by_cam
+    return new_vio, new_visual, t_cam1, t_cam1[kept], kept
+
+
+def pack_visual_observations(
+    visual_meas: dict,
+    tid_to_lm_idx: dict,
+    anchor_factor_stride: int = 1,
+    max_klt_obs_per_landmark: int | None = None,
+):
     """Flattens anchor tag corner observations and KLT track observations into vectorized arrays."""
     # Anchor tag corners are stored in the tag's local frame. The backend adds
     # an optimizable anchor pose variable and transforms them into the world
     # frame inside each visual factor.
     anc_frames, anc_tag_ids, anc_pts_local, anc_pts_w, anc_uv = [], [], [], [], []
-    for obs in visual_meas["anchor_obs"]:
+    anchor_obs = visual_meas["anchor_obs"]
+    factor_stride = max(1, int(anchor_factor_stride))
+    if factor_stride > 1:
+        subsampled = [
+            obs for obs in anchor_obs if int(obs["frame_idx"]) % factor_stride == 0
+        ]
+        if subsampled:
+            anchor_obs = subsampled
+    for obs in anchor_obs:
         f_idx = int(obs["frame_idx"])
         tag_id = int(obs["tag_id"])
         local = np.asarray(obs.get("corners_local"), dtype=np.float64).reshape(-1, 3)
@@ -201,8 +335,20 @@ def pack_visual_observations(visual_meas: dict, tid_to_lm_idx: dict):
     klt_frames, klt_lm_idx, klt_uv = [], [], []
     klt_tracks = visual_meas["klt_tracks"]["cam1"]
     for tid, lm_idx in tid_to_lm_idx.items():
-        for f_idx, uv, _ in klt_tracks[tid]:
-            klt_frames.append(int(f_idx))
+        obs_list = klt_tracks[tid]
+        if max_klt_obs_per_landmark and len(obs_list) > int(max_klt_obs_per_landmark):
+            sample_idx = np.linspace(
+                0, len(obs_list) - 1, int(max_klt_obs_per_landmark), dtype=np.int64
+            )
+            obs_list = [obs_list[int(i)] for i in sample_idx]
+        for obs in obs_list:
+            f_idx = int(obs[0])
+            if len(obs) == 6:
+                # Compact (frame, u, v, rx, ry, rz) observation.
+                uv = (obs[1], obs[2])
+            else:
+                uv = obs[1]
+            klt_frames.append(f_idx)
             klt_lm_idx.append(lm_idx)
             klt_uv.append(uv)
 
@@ -213,3 +359,57 @@ def pack_visual_observations(visual_meas: dict, tid_to_lm_idx: dict):
     }
 
     return anchor_packed, klt_packed
+
+
+def _interpolate_pose(T0: np.ndarray, T1: np.ndarray, alpha: float) -> np.ndarray:
+    """Interpolates a rigid transform with geodesic rotation and linear translation."""
+    R0, p0 = T0[:3, :3], T0[:3, 3]
+    R1, p1 = T1[:3, :3], T1[:3, 3]
+    dR = R0 @ so3_exp(float(alpha) * so3_log(R0.T @ R1))
+    dp = (1.0 - float(alpha)) * p0 + float(alpha) * p1
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = dR
+    T[:3, 3] = dp
+    return T
+
+
+def interpolate_vio_result(result: dict, t_backend: np.ndarray, t_full: np.ndarray) -> dict:
+    """Expands a downsampled backend result back to the full camera frame rate."""
+    t_backend = np.asarray(t_backend, dtype=np.float64)
+    t_full = np.asarray(t_full, dtype=np.float64)
+    if len(t_backend) == len(t_full) and np.array_equal(t_backend, t_full):
+        return result
+
+    if len(t_backend) < 2:
+        raise ValueError("At least two backend timestamps are required for interpolation")
+
+    right = np.searchsorted(t_backend, t_full, side="right") - 1
+    i0 = np.clip(right, 0, len(t_backend) - 2)
+    alpha = np.clip(
+        (t_full - t_backend[i0]) / np.maximum(t_backend[i0 + 1] - t_backend[i0], 1e-12),
+        0.0,
+        1.0,
+    )
+
+    def interp_pose_array(key: str) -> np.ndarray:
+        src = np.asarray(result[key], dtype=np.float64)
+        return np.stack(
+            [
+                _interpolate_pose(src[i0[i]], src[i0[i] + 1], alpha[i])
+                for i in range(len(t_full))
+            ],
+            axis=0,
+        )
+
+    def interp_vector_array(key: str) -> np.ndarray:
+        src = np.asarray(result[key], dtype=np.float64)
+        return (1.0 - alpha[:, None]) * src[i0] + alpha[:, None] * src[i0 + 1]
+
+    expanded = dict(result)
+    expanded["t_cam1"] = t_full.copy()
+    expanded["T_world_imu"] = interp_pose_array("T_world_imu")
+    expanded["T_world_cam1"] = interp_pose_array("T_world_cam1")
+    for key in ("v_world", "b_gyro", "b_accel"):
+        if key in result:
+            expanded[key] = interp_vector_array(key)
+    return expanded

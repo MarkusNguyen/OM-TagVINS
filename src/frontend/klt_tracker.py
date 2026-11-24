@@ -20,16 +20,28 @@ class IMUAidedFisheyeKLTTracker:
       3) 2-point Gyro-aided epipolar RANSAC for dynamic outlier rejection
     """
 
-    def __init__(self, cam: dict, static_mask: np.ndarray, max_corners: int = 250):
+    def __init__(
+        self,
+        cam: dict,
+        static_mask: np.ndarray,
+        max_corners: int = 4000,
+        min_track_len: int = 3,
+        max_track_len: int = 300,
+    ):
         self.cam = cam
         self.static_mask = static_mask
         self.max_corners = max_corners
+        self.min_track_len = max(2, int(min_track_len))
+        self.max_track_len = max(self.min_track_len, int(max_track_len))
         self.next_track_id = 0
         self.prev_gray = None
         self.prev_pts = np.empty((0, 2), dtype=np.float32)
         self.prev_rays = np.empty((0, 3), dtype=np.float64)
         self.prev_ids = np.empty((0,), dtype=np.int64)
-        self.tracks = {}  # track_id -> list of (frame_idx, uv, unit_ray)
+        # Active tracks only. A retired track is moved to ``finished_tracks`` so
+        # its history cannot keep growing for the rest of a long recording.
+        self.tracks = {}  # track_id -> list of compact observations
+        self.finished_tracks = {}  # track_id -> list of compact observations
 
     def _predict_initial_pixels(self, dR_c1_c0: np.ndarray, img_shape: tuple[int, int]) -> np.ndarray:
         """Rotates previous 3D bearing rays by dR_c1_c0 and projects onto current fisheye frame."""
@@ -125,12 +137,29 @@ class IMUAidedFisheyeKLTTracker:
             ids_v = self.prev_ids[valid]
             r1_v = unproject_kannala_brandt(pts1_v, self.cam)
 
+            # Retire tracks whose feature disappeared before RANSAC so rejected
+            # points cannot leave stale active histories behind.
+            active_ids = {int(tid) for tid in ids_v}
+            for tid in self.prev_ids:
+                tid_int = int(tid)
+                if tid_int in active_ids:
+                    continue
+                history = self.tracks.pop(tid_int, None)
+                if history is not None and len(history) >= self.min_track_len:
+                    self.finished_tracks[tid_int] = history
+
             # Geometric outlier & dynamic object rejection via 2-point Gyro RANSAC
             if dR_c1_c0 is not None and len(r0_v) >= 6:
                 keep = ransac_2pt_gyro_epipolar(r0_v, r1_v, dR_c1_c0)
                 pts1_v = pts1_v[keep]
                 r1_v = r1_v[keep]
+                rejected_ids = ids_v[~keep]
                 ids_v = ids_v[keep]
+                for tid in rejected_ids:
+                    tid_int = int(tid)
+                    history = self.tracks.pop(tid_int, None)
+                    if history is not None and len(history) >= self.min_track_len:
+                        self.finished_tracks[tid_int] = history
         else:
             pts1_v = np.empty((0, 2), dtype=np.float32)
             r1_v = np.empty((0, 3), dtype=np.float64)
@@ -147,7 +176,17 @@ class IMUAidedFisheyeKLTTracker:
         cur_ids = np.concatenate([ids_v, new_ids]) if len(new_ids) else ids_v
 
         for tid, uv, ray in zip(cur_ids, cur_pts, cur_rays):
-            self.tracks.setdefault(int(tid), []).append((frame_idx, uv.copy(), ray.copy()))
+            # Plain floats are much cheaper than one tuple plus two NumPy arrays
+            # per observation; triangulation converts them back in batches.
+            observation = (
+                int(frame_idx),
+                float(uv[0]), float(uv[1]),
+                float(ray[0]), float(ray[1]), float(ray[2]),
+            )
+            history = self.tracks.setdefault(int(tid), [])
+            history.append(observation)
+            if len(history) > self.max_track_len:
+                del history[0]
 
         self.prev_gray = gray
         self.prev_pts = cur_pts

@@ -96,7 +96,7 @@ def load_rolling_shutter_readout_s(source: Path) -> float:
     except ImportError as exc:  # pragma: no cover - dependency guard
         raise RuntimeError(
             "telemetry-parser is required to read Insta360 rolling-shutter "
-            "metadata; install config/requirements.txt"
+            "metadata; install dependencies with `uv sync`"
         ) from exc
 
     parser = telemetry_parser.Parser(str(source))

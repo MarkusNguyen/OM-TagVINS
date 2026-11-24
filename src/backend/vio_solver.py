@@ -17,8 +17,10 @@ from ..core.camera_model import project_kb_with_jacobian
 from ..core.lie_algebra import so3_exp, so3_inv_right_jacobian, so3_log
 from .imu_preintegration import PreintegratedIMUFactor
 from .vio_initialization import (
+    downsample_backend_frames,
     extract_frame_gyros,
     initialize_vio_states,
+    interpolate_vio_result,
     pack_visual_observations,
 )
 
@@ -332,7 +334,7 @@ def _anchor_gauge_noise(
 def run_batch_vio_optimization(
     vio_data: dict,
     visual_meas: dict,
-    max_iters: int = 40,
+    max_iters: int = 30,
     anchor_sigma_px: float = 0.5,
     klt_sigma_px: float = 0.40,
     huber_delta_px: float = 2.5,
@@ -342,6 +344,9 @@ def run_batch_vio_optimization(
     klt_omega_rate_scale: float = 0.0,
     estimate_time_offset: bool = True,
     time_offset_prior_s: float = 0.005,
+    anchor_factor_stride: int = 1,
+    max_klt_obs_per_landmark: int | None = None,
+    backend_frame_stride: int = 1,
 ) -> dict:
     """Runs full-batch GTSAM VIO bundle adjustment.
 
@@ -350,11 +355,13 @@ def run_batch_vio_optimization(
     and optional 1-DoF camera-IMU time-offset optimization.
     """
     t0 = time.perf_counter()
-    N = len(vio_data["t_cam1"])
+    full_vio_data = vio_data
+    full_visual_meas = visual_meas
+    full_times = np.asarray(vio_data["t_cam1"], dtype=np.float64)
     cam1 = vio_data["cams"]["cam1"]
     td = 0.0  # initial; optimized below if enabled
 
-    imu_cfg = vio_data.get("imu_cfg", {})
+    imu_cfg = full_vio_data.get("imu_cfg", {})
     g_mag = float(imu_cfg.get("g", imu_cfg.get("gravity_magnitude", 9.80665)))
     sigma_g = float(imu_cfg.get("gyro_noise_density", imu_cfg.get("gyroscope_noise_density", 1.8e-4)))
     sigma_a = float(imu_cfg.get("accel_noise_density", imu_cfg.get("accelerometer_noise_density", 2.0e-3)))
@@ -363,8 +370,10 @@ def run_batch_vio_optimization(
     gyro_correction = np.asarray(imu_cfg.get("gyro_correction", np.eye(3, dtype=np.float64)), dtype=np.float64).reshape(3, 3)
     accel_correction = np.asarray(imu_cfg.get("accel_correction", np.eye(3, dtype=np.float64)), dtype=np.float64).reshape(3, 3)
 
-    b_gyro_0 = np.asarray(vio_data["b_gyro_0"], dtype=np.float64)
+    b_gyro_0 = np.asarray(full_vio_data["b_gyro_0"], dtype=np.float64)
     # Intervals from preprocess: gyro has gyro_sign only; accel already has accel_correction.
+    # Initialize at full rate first: sparse PnP/IMU alignment is much less stable
+    # when the frame interval is artificially enlarged.
     preint_factors = [
         PreintegratedIMUFactor(
             iv, b_gyro_0, np.zeros(3),
@@ -372,15 +381,53 @@ def run_batch_vio_optimization(
             gyro_correction=gyro_correction,
             accel_correction=np.eye(3, dtype=np.float64),
         )
-        for iv in vio_data["imu_intervals_cam1"]
+        for iv in full_vio_data["imu_intervals_cam1"]
     ]
 
     R_wi, p_wi, v_w, bg, ba, landmarks, tid_to_lm_idx, R_g = initialize_vio_states(
-        vio_data, visual_meas, preint_factors, g_mag=g_mag
+        full_vio_data, full_visual_meas, preint_factors, g_mag=g_mag
     )
+
+    backend_times = full_times
+    stride = max(1, int(backend_frame_stride))
+    if stride > 1:
+        vio_data, visual_meas, full_times, backend_times, kept = downsample_backend_frames(
+            full_vio_data, full_visual_meas, stride
+        )
+        R_wi = R_wi[kept].copy()
+        p_wi = p_wi[kept].copy()
+        v_w = v_w[kept].copy()
+        bg = bg[kept].copy()
+        ba = ba[kept].copy()
+        full_lm_dict = full_visual_meas["landmarks_world"]["cam1"]
+        reduced_lm_ids = sorted(visual_meas["landmarks_world"]["cam1"])
+        landmarks = (
+            np.asarray([full_lm_dict[tid] for tid in reduced_lm_ids], dtype=np.float64)
+            if reduced_lm_ids
+            else np.zeros((0, 3), dtype=np.float64)
+        )
+        tid_to_lm_idx = {tid: idx for idx, tid in enumerate(reduced_lm_ids)}
+        print(
+            f"Backend frame stride {stride}: optimizing {len(backend_times)} "
+            f"of {len(full_times)} frames; output will be interpolated back to full rate",
+            flush=True,
+        )
+
+    N = len(vio_data["t_cam1"])
     M = len(landmarks)
     omega_raw = extract_frame_gyros(vio_data)
-    anchor_packed, klt_packed = pack_visual_observations(visual_meas, tid_to_lm_idx)
+    anchor_packed, klt_packed = pack_visual_observations(
+        visual_meas,
+        tid_to_lm_idx,
+        anchor_factor_stride=anchor_factor_stride,
+        max_klt_obs_per_landmark=max_klt_obs_per_landmark,
+    )
+    print(
+        f"Batch graph: frames={N}, landmarks={M}, "
+        f"anchor factors={len(anchor_packed['frame_idx'])}, "
+        f"KLT factors={len(klt_packed['frame_idx'])}",
+        flush=True,
+    )
 
     # Rotate initial states into gravity-aligned world frame for GTSAM IMU
     # (gravity = [0,0,-g] in navigation frame).
@@ -568,8 +615,8 @@ def run_batch_vio_optimization(
         for tid, akey in anchor_key_by_tag.items()
     }
 
-    return {
-        "t_cam1": np.asarray(vio_data["t_cam1"], dtype=np.float64),
+    result = {
+        "t_cam1": np.asarray(backend_times, dtype=np.float64),
         "T_world_imu": T_world_imu,
         "T_world_cam1": T_world_cam1,
         "v_world": v_world_out0 @ R_align.T,
@@ -584,3 +631,6 @@ def run_batch_vio_optimization(
         # with allow_pickle=False keeps working.
         "T_world_tag": next(iter(anchor_poses_out.values())),
     }
+    if stride > 1:
+        result = interpolate_vio_result(result, backend_times, full_times)
+    return result
