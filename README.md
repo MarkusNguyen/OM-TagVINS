@@ -246,20 +246,21 @@ or factor weights and optimizer convergence in `src/backend/vio_solver.py`.
 - telemetry-parser
 - GTSAM
 
-Dependencies are declared in `pyproject.toml`. Install Python 3.12 and create the environment with `uv`:
+Dependencies are declared in `pyproject.toml` as a [pixi](https://pixi.sh/) workspace. Python, NumPy, SciPy, OpenCV, pandas, PyYAML, and GTSAM come from `conda-forge`; the remaining PyPI-only packages are installed into the same environment. Install pixi, then create the environment with:
 
 ```powershell
-uv python install 3.12
-uv sync
+pixi install
 ```
 
 Then run the pipeline with:
 
 ```powershell
-uv run python -u trajectory.py --rrd "logs\base\VID_20261117_145759_00_025.rrd"
+pixi run trajectory --rrd "logs\base\VID_20261117_145759_00_025.rrd"
 ```
 
-`uv sync` creates `.venv/` and `uv.lock` from `pyproject.toml`. `config/requirements.txt` is kept only as an optional pip-compatible reference.
+or, equivalently, `pixi run python -u trajectory.py --rrd ...`.
+
+`pixi install` creates `.pixi/` and `pixi.lock` from `pyproject.toml`. Using conda-forge is required for GTSAM: it has no Windows wheel on PyPI.
 
 ## Input data
 
@@ -275,7 +276,7 @@ The rear-camera frames are expected to be square fisheye frames. The supplied ca
 If starting from an Insta360 `.insv` file:
 
 ```bash
-uv run python converter.py input/60Hz.insv
+pixi run python converter.py input/60Hz.insv
 ```
 
 This writes `logs/base/60Hz.rrd`. Conversion uses `telemetry-parser` to read
@@ -293,7 +294,7 @@ The command-line entry point is `trajectory.py`. It runs VIO through
 trajectory:
 
 ```bash
-uv run python trajectory.py --rrd logs/base/60Hz.rrd
+pixi run python trajectory.py --rrd logs/base/60Hz.rrd
 ```
 
 With `--rrd`, VIO runs first. With `--npz`, an existing camera trajectory is
@@ -315,7 +316,7 @@ The `.npz` contains `t_tcp`, `T_world_tcp`, `T_tcp0_tcp`, `T_world_cam1`,
 `T_world_tag`. Open the Rerun recording with:
 
 ```bash
-uv run rerun logs/estimate/60Hz_tcp_vio.rrd
+pixi run rerun logs/estimate/60Hz_tcp_vio.rrd
 ```
 
 The TCP `.rrd` contains:
@@ -427,7 +428,7 @@ The AprilTag pose can have two planar-PnP branches. The frontend keeps only bran
 Any value from `config/vio.yaml` can be overridden on the command line:
 
 ```bash
-uv run python trajectory.py \
+pixi run python trajectory.py \
   --rrd logs/base/60Hz.rrd \
   --anchor-sigma 0.30 \
   --min-parallax-deg 0.15 \
@@ -442,7 +443,7 @@ uv run python trajectory.py \
 Use a different YAML file:
 
 ```bash
-uv run python trajectory.py \
+pixi run python trajectory.py \
   --rrd logs/base/60Hz.rrd \
   --vio-config path/to/other.yaml
 ```
@@ -450,7 +451,7 @@ uv run python trajectory.py \
 Set custom output paths:
 
 ```bash
-uv run python trajectory.py \
+pixi run python trajectory.py \
   --rrd logs/base/60Hz.rrd \
   --out-npz logs/estimate/custom.npz \
   --viz logs/estimate/custom.rrd

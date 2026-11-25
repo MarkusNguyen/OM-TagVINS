@@ -2,7 +2,8 @@
 *.rrd
 *.npz
 
-# uv environments
+# pixi / uv environments
+.pixi/
 .venv/
 
 # Python caches
