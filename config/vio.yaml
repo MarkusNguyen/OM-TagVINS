@@ -1,9 +1,5 @@
 frontend:
 
-# Specialist-matched frontend values. These are much heavier than the
-
-# previous runtime-tuned values (220 / 5 / 90 / 24).
-
 max_corners_per_cam: 220
 min_track_len: 5
 min_parallax_deg: 0.5
