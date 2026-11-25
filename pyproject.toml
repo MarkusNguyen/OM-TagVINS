@@ -13,7 +13,7 @@ dependencies = [
     "pupil-apriltags>=1.0.4,<2",
     "pandas>=2,<3",
     "telemetry-parser>=0.4",
-    "gtsam>=4.2,<5",
+    "gtsam==4.3.0; sys_platform != 'win32'",
 ]
 
 # This repository is a set of runnable scripts, not an installable Python package.

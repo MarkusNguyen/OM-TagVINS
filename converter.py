@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Usage:
-#   python video_processor.py sample.insv
+#   python converter.py sample.insv
 #
 # Output:
 #   data/base/<input>.rrd
