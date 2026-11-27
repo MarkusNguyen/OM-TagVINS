@@ -1,24 +1,25 @@
+anchor:
+  id: 0
+  size_m: 0.17064548674002974
 frontend:
-
-max_corners_per_cam: 220
-min_track_len: 5
-min_parallax_deg: 0.5
-max_track_len: 300
-max_triangulation_obs: 8
-tag_detect_stride: 1  
-tag_detect_scale: 0.5
-
-
+  max_corners_per_cam: 220
+  min_track_len: 5
+  min_parallax_deg: 0.5
+  max_track_len: 300
+  max_triangulation_obs: 8
+  tag_detect_stride: 1
+  tag_detect_scale: 0.5
 optimizer:
-
-max_iters: 30
-anchor_factor_stride: 4
-max_klt_obs_per_landmark: 30
-backend_frame_stride: 2
-anchor_sigma_px: 0.05
-klt_sigma_px: 0.45
-anchor_huber_px: 5.0
-klt_huber_px: 2.0
-klt_omega_rate_scale: 0.15
-rolling_shutter_readout_s: null
-estimate_time_offset: false
+  max_iters: 30
+  anchor_factor_stride: 1
+  max_klt_obs_per_landmark: 30
+  backend_frame_stride: 1
+  anchor_sigma_px: 0.05
+  klt_sigma_px: 0.45
+  anchor_huber_px: 5.0
+  klt_huber_px: 2.0
+  klt_omega_rate_scale: 0.15
+  rolling_shutter_readout_s: 0.004
+  estimate_time_offset: false
+output:
+  time_origin_offset_s: -0.23

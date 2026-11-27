@@ -487,6 +487,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
+    output_args = parser.add_argument_group("Output options")
+    output_args.add_argument(
+        "--time-origin-offset",
+        type=float,
+        default=cfg["output"]["time_origin_offset_s"],
+        help="Seconds added to exported TCP timestamps before evaluation",
+    )
+
     return parser.parse_args()
 
 
@@ -516,10 +524,13 @@ def main() -> None:
 
     tcp_poses = camera_to_tcp(camera_poses, T_cam_tcp)
     relative_poses = rebase_trajectory(tcp_poses)
+    export_timestamps = np.asarray(timestamps, dtype=np.float64) + float(
+        args.time_origin_offset
+    )
 
     output_npz.parent.mkdir(parents=True, exist_ok=True)
     output_arrays = {
-        "t_tcp": timestamps,
+        "t_tcp": export_timestamps,
         "T_world_tcp": tcp_poses,
         "T_tcp0_tcp": relative_poses,
         "T_world_cam1": camera_poses,
@@ -531,6 +542,8 @@ def main() -> None:
     print(f"Mode: {mode_label}")
     print(f"{input_label}: {input_path}")
     print(f"Extrinsics: {args.config} ({source})")
+    if float(args.time_origin_offset) != 0.0:
+        print(f"Time-origin offset applied to export: {args.time_origin_offset:+.3f} s")
     if np.allclose(T_cam_tcp, np.eye(4), atol=1e-12):
         print("Note: camera-to-TCP transform is identity (placeholder)")
     print(f"TCP poses: {len(tcp_poses)}")
@@ -540,7 +553,7 @@ def main() -> None:
     print(f"Saved TCP trajectory to {output_npz}")
 
     if output_rrd is not None:
-        log_tcp_trajectory(output_rrd, relative_poses, timestamps)
+        log_tcp_trajectory(output_rrd, relative_poses, export_timestamps)
         print(f"Saved TCP Rerun recording to {output_rrd}")
         print("Moving TCP marker logged as world/tcp_marker on the time timeline")
 

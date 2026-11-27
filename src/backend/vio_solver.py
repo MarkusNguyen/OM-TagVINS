@@ -277,6 +277,10 @@ def _visual_factor(
             S_XI = _skew(X_I)
             S_vI = _skew(v_I)
             dX_dphi = R_off_T @ S_XI - dt_eff * S_vI
+            # GTSAM Pose3::retract applies a local-frame translation update:
+            # p' = p + R * dt. For X_I = R.T @ (Xw - p), dX_I/dp = -I, but the
+            # rolling-shutter rotation offset acts after that: X_I_off involves
+            # R_off_T @ X_I, so the pose-translation derivative is -R_off_T.
             dX_dp = -R_off_T
             dX_dv = -dt_eff * R_wi.T
             Hpose = np.zeros((2, 6), dtype=np.float64)

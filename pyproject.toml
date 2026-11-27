@@ -5,18 +5,26 @@ description = "Rear-camera visual-inertial odometry with a stationary AprilTag a
 authors = [{ name = "MarkusNguyen", email = "11525061@student.vgu.edu.vn" }]
 requires-python = ">=3.12,<3.13"
 
-# PyPI-only packages. Pixi installs these into the conda environment.
 dependencies = [
+    "numpy>=1.24,<3",
+    "scipy>=1.10,<2",
+    "opencv-python>=4.8,<5",
+    "pyyaml>=6.0,<7",
+    "pandas>=2,<3",
     "rerun-sdk[catalog]>=0.37.2,<0.38",
     "pupil-apriltags>=1.0.4,<2",
     "telemetry-parser>=0.4",
 ]
 
+[project.scripts]
+om-tagvins = "trajectory:main"
+
+# TEMPORARY: retained while tuning so `pixi run` can use the existing env.
+# Remove before the final uv-only cleanup.
 [tool.pixi.workspace]
 channels = ["conda-forge"]
 platforms = ["win-64", "linux-64"]
 
-# Conda-forge packages, including GTSAM (which has no Windows wheel on PyPI).
 [tool.pixi.dependencies]
 python = ">=3.12,<3.13"
 numpy = ">=1.24,<3"

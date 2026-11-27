@@ -69,6 +69,9 @@ def solve_tag_pose_fisheye(
         R, _ = cv2.Rodrigues(rvec)
         if not np.all(np.isfinite(R)):
             continue
+        # Reject solutions where the tag normal points away from the camera.
+        if float(R[:, 2] @ tvec) >= 0.0:
+            continue
         T_cam_tag = np.eye(4, dtype=np.float64)
         T_cam_tag[:3, :3] = R
         T_cam_tag[:3, 3] = tvec
@@ -83,8 +86,11 @@ def solve_tag_pose_fisheye(
     # wrong branch, but it must not override an obviously worse reprojection
     # fit. Keep only branches whose reprojection error is close to the best one.
     best_reproj_err = min(float(item[1]) for item in candidates)
+    # OpenCV returns normalized tangent-plane error here; convert the 3 px gate
+    # to the same units. The old +3.0 tolerance effectively disabled this check.
+    reproj_tol = 3.0 / max(float(cam["fx"]), float(cam["fy"]))
     candidates = [
-        item for item in candidates if float(item[1]) <= best_reproj_err + 3.0
+        item for item in candidates if float(item[1]) <= best_reproj_err + reproj_tol
     ]
     if len(candidates) == 1:
         return candidates[0][0]

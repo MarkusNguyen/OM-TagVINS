@@ -11,13 +11,13 @@ DEFAULT_CONFIG_PATH = "config/vio.yaml"
 DEFAULT_RUN_CONFIG = {
     "anchor": {
         "id": 0,
-        "size_m": 0.100,
+        # Effective metric anchor size for this recording.
+        "size_m": 0.180,
     },
     "frontend": {
-        # Specialist-matched defaults. These are significantly heavier than
-        # the previous runtime-tuned values (220 / 5 / 90 / 24).
-        "max_corners_per_cam": 4000,
-        "min_track_len": 3,
+        # Runtime-tuned defaults. config/vio.yaml is the effective source.
+        "max_corners_per_cam": 220,
+        "min_track_len": 5,
         "min_parallax_deg": 0.5,
         # Dead KLT tracks are still retired instead of growing one Python list
         # per observation forever. Specialist counts track span in keyframes;
@@ -55,6 +55,12 @@ DEFAULT_RUN_CONFIG = {
         # Online estimation of the camera-minus-IMU timing offset.
         "estimate_time_offset": False,
         "time_offset_prior_s": 0.005,
+    },
+    "output": {
+        # Added to exported TCP timestamps so the documented ATE offset stays
+        # -5.5 s even when the best trajectory shape aligns at a slightly
+        # different raw timestamp offset.
+        "time_origin_offset_s": 0.0,
     },
 }
 

@@ -4,17 +4,23 @@ The estimate is a ``*_trajectory.npz`` produced by ``trajectory.py``. By default
 the newest ``*_tcp_trajectory.npz`` in ``logs/estimate/`` is used and its
 ``T_world_tcp`` poses are compared against ``groundtruth/traj_tum.txt``.
 
+Translation uses the usual Umeyama similarity alignment. Rotation uses a
+separate orientation-only Procrustes fit: the rotation that aligns a point
+cloud does not generally align camera orientations, because VIO world frames
+have an arbitrary gauge.
+
 The ground-truth file is expected to be TUM RGB-D format:
 
     timestamp tx ty tz qx qy qz qw        # quaternion is x, y, z, w
 
-Usage (from the repo root, with a pixi environment installed):
+Usage (from the repo root, with `uv`):
 
-    pixi run python ATE.py
-    pixi run python ATE.py --est logs/estimate/VID_20261117_145759_00_025_tcp_trajectory.npz
-    pixi run python ATE.py --pose-key T_world_cam1 --time-offset 0.0 --max-diff 0.02
-    pixi run python ATE.py --no-align          # raw error, no Umeyama alignment
-    pixi run python ATE.py --scale             # allow sim(3) scale correction
+    uv run python ATE.py
+    uv run python ATE.py --est logs/estimate/VID_20261117_145759_00_025_tcp_trajectory.npz
+    uv run python ATE.py --time-offset -5.5
+    uv run python ATE.py --pose-key T_world_cam1 --time-offset 0.0 --max-diff 0.02
+    uv run python ATE.py --no-align          # raw error, no Umeyama alignment
+    uv run python ATE.py --scale             # allow sim(3) scale correction
 """
 
 from __future__ import annotations
@@ -154,13 +160,36 @@ def umeyama(
     return scale, rot, trans
 
 
+def rotation_procrustes(
+    est_rots: np.ndarray,
+    gt_rots: np.ndarray,
+) -> np.ndarray:
+    """Find R such that R @ R_est ≈ R_gt for all matched poses."""
+    est_rots = np.asarray(est_rots, dtype=np.float64)
+    gt_rots = np.asarray(gt_rots, dtype=np.float64)
+    # Minimize sum ||R @ E_i - G_i||_F. With column-vector rotations, the
+    # solution is R = U @ Vt for SVD(sum G_i @ E_i.T).
+    m = np.einsum("nij,nkj->ik", gt_rots, est_rots)
+    u, _, vt = np.linalg.svd(m)
+    rot = u @ vt
+    if np.linalg.det(rot) < 0.0:
+        u[:, -1] *= -1.0
+        rot = u @ vt
+    return rot
+
+
 def apply_alignment(
     poses: np.ndarray,
     scale: float,
     rot: np.ndarray,
     trans: np.ndarray,
 ) -> np.ndarray:
-    """Apply (scale, rot, trans) to 4x4 poses, scaling translations only."""
+    """Apply a translation-alignment transform to 4x4 poses.
+
+    The rotation comes from aligning point positions. It is applied to the
+    rotation block for completeness, but rotation ATE is reported separately
+    using ``rotation_procrustes()``.
+    """
     aligned = poses.copy()
     aligned[:, :3, :3] = rot[None, :, :] @ poses[:, :3, :3]
     aligned[:, :3, 3] = scale * (poses[:, :3, 3] @ rot.T) + trans
@@ -252,6 +281,7 @@ def main() -> None:
     report("Un-aligned translation", raw_trans, "m")
     report("Un-aligned rotation", raw_rot, "deg")
 
+    rotation_aligned = est_matched.copy()
     if args.no_align:
         aligned = est_matched
     else:
@@ -260,21 +290,33 @@ def main() -> None:
         )
         aligned = apply_alignment(est_matched, scale, rot, trans)
         t_str = f"t=[{trans[0]:.4f}, {trans[1]:.4f}, {trans[2]:.4f}] m"
-        print(f"Alignment: scale={scale:.6f} {t_str}")
+        print(f"Position alignment: scale={scale:.6f} {t_str}")
 
-    trans_err, rot_err = pose_errors(gt_matched, aligned)
+        rot_align = rotation_procrustes(
+            est_matched[:, :3, :3], gt_matched[:, :3, :3]
+        )
+        rotation_aligned[:, :3, :3] = rot_align[None, :, :] @ est_matched[:, :3, :3]
+        print(f"Orientation alignment: R={np.array2string(rot_align, precision=4)}")
+
+    trans_err, _ = pose_errors(gt_matched, aligned)
+    _, rot_err = pose_errors(gt_matched, rotation_aligned)
     ate = report("ATE translation", trans_err, "m")
-    report("ATE rotation", rot_err, "deg")
-    print(f"ATE RMSE summary: {ate:.6f} m over {len(gt_idx)} poses")
+    are = report("ATE rotation", rot_err, "deg")
+    print(
+        f"ATE RMSE summary: {ate:.6f} m, {are:.6f} deg over "
+        f"{len(gt_idx)} poses"
+    )
 
     if args.save_aligned is not None:
+        aligned_poses = aligned.copy()
+        aligned_poses[:, :3, :3] = rotation_aligned[:, :3, :3]
         args.save_aligned.parent.mkdir(parents=True, exist_ok=True)
         np.savez(
             args.save_aligned,
             t_gt=gt_t[gt_idx],
             t_est=est_t[est_idx] + args.time_offset,
             T_gt=gt_matched,
-            T_est_aligned=aligned,
+            T_est_aligned=aligned_poses,
             trans_error_m=trans_err,
             rot_error_deg=rot_err,
         )

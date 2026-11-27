@@ -138,6 +138,10 @@ def extract_visual_measurements(
                 corners_uv = refine_tag_corners_virtual_pinhole(
                     gray_rear, rough_corners, tid, cam1, detector
                 )
+                # pupil_apriltags returns corners as BL, BR, TR, TL, but
+                # SOLVEPNP_IPPE_SQUARE and get_tag_corners_3d() both use
+                # TL, TR, BR, BL. Reorder once so every consumer agrees.
+                corners_uv = corners_uv[[3, 2, 1, 0]]
                 info = anchor_tags[tid]
                 rays = unproject_kannala_brandt(corners_uv, cam)
                 anchor_obs.append({

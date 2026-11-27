@@ -246,21 +246,19 @@ or factor weights and optimizer convergence in `src/backend/vio_solver.py`.
 - telemetry-parser
 - GTSAM
 
-Dependencies are declared in `pyproject.toml` as a [pixi](https://pixi.sh/) workspace. Python, NumPy, SciPy, OpenCV, pandas, PyYAML, and GTSAM come from `conda-forge`; the remaining PyPI-only packages are installed into the same environment. Install pixi, then create the environment with:
+Dependencies are declared in `pyproject.toml` and managed with [uv](https://docs.astral.sh/uv/). Create the environment with:
 
 ```powershell
-pixi install
+uv sync
 ```
 
 Then run the pipeline with:
 
 ```powershell
-pixi run trajectory --rrd "logs\base\VID_20261117_145759_00_025.rrd"
+uv run python -u trajectory.py --rrd "logs\base\VID_20261117_145759_00_025.rrd"
 ```
 
-or, equivalently, `pixi run python -u trajectory.py --rrd ...`.
-
-`pixi install` creates `.pixi/` and `pixi.lock` from `pyproject.toml`. Using conda-forge is required for GTSAM: it has no Windows wheel on PyPI.
+GTSAM must be importable in that interpreter. If PyPI has no wheel for your platform, install a matching GTSAM build into the environment before running the pipeline.
 
 ## Input data
 
@@ -276,7 +274,7 @@ The rear-camera frames are expected to be square fisheye frames. The supplied ca
 If starting from an Insta360 `.insv` file:
 
 ```bash
-pixi run python converter.py input/60Hz.insv
+uv run python converter.py input/60Hz.insv
 ```
 
 This writes `logs/base/60Hz.rrd`. Conversion uses `telemetry-parser` to read
@@ -294,7 +292,7 @@ The command-line entry point is `trajectory.py`. It runs VIO through
 trajectory:
 
 ```bash
-pixi run python trajectory.py --rrd logs/base/60Hz.rrd
+uv run python trajectory.py --rrd logs/base/60Hz.rrd
 ```
 
 With `--rrd`, VIO runs first. With `--npz`, an existing camera trajectory is
@@ -316,7 +314,7 @@ The `.npz` contains `t_tcp`, `T_world_tcp`, `T_tcp0_tcp`, `T_world_cam1`,
 `T_world_tag`. Open the Rerun recording with:
 
 ```bash
-pixi run rerun logs/estimate/60Hz_tcp_vio.rrd
+uv run rerun logs/estimate/60Hz_tcp_vio.rrd
 ```
 
 The TCP `.rrd` contains:
@@ -348,13 +346,13 @@ result = run_vio("logs/base/60Hz.rrd")   # returns T_world_cam1, T_world_imu, ..
 ```yaml
 anchor:
   id: 0
-  size_m: 0.100
+  # Effective metric anchor size for this recording. This is the metric scale
+  # knob for PnP poses and anchor factors, and therefore for the VIO trajectory.
+  size_m: 0.180
 
 frontend:
-  # Specialist-matched frontend values.
-  # These are much heavier than the previous runtime-tuned values.
-  max_corners_per_cam: 4000
-  min_track_len: 3
+  max_corners_per_cam: 220
+  min_track_len: 5
   min_parallax_deg: 0.5
   max_track_len: 300
   max_triangulation_obs: 8
@@ -362,17 +360,16 @@ frontend:
   tag_detect_scale: 0.5
 
 optimizer:
-  # Specialist SolverCfg.max_iterations.
   max_iters: 30
-  # Batch-graph size controls (initialization still uses all detections)
+  # Batch-graph size controls (initialization still uses all detections).
   anchor_factor_stride: 4
   max_klt_obs_per_landmark: 30
   backend_frame_stride: 2
-  anchor_sigma_px: 1.05
-  klt_sigma_px: 0.5
-  anchor_huber_px: 1.41
-  klt_huber_px: 0.67
-  klt_omega_rate_scale: 0.0
+  anchor_sigma_px: 0.05
+  klt_sigma_px: 0.45
+  anchor_huber_px: 5.0
+  klt_huber_px: 2.0
+  klt_omega_rate_scale: 0.15
   rolling_shutter_readout_s: null
   estimate_time_offset: false
   time_offset_prior_s: 0.005
@@ -384,15 +381,15 @@ optimizer:
 
 | Key | Meaning | Default |
 |---|---|---:|
-| `max_corners_per_cam` | Maximum tracked KLT corners; Specialist `max_corners` | `4000` |
-| `min_track_len` | Minimum KLT track length in frames; Specialist `min_track_length` | `3` |
+| `max_corners_per_cam` | Maximum tracked KLT corners | `220` |
+| `min_track_len` | Minimum KLT track length in frames | `5` |
 | `min_parallax_deg` | Minimum KLT bearing parallax for triangulation | `0.5` |
 | `max_track_len` | Maximum observations retained per KLT track; numeric match to Specialist `max_track_span` (keyframes) | `300` |
 | `max_triangulation_obs` | Observations sampled per track for DLT triangulation; numeric match to Specialist `max_obs_per_track` | `8` |
 | `tag_detect_stride` | Run AprilTag detection every N-th frame (keep at `1` for stable PnP initialization) | `1` |
 | `tag_detect_scale` | Detection image scale; corners are still refined at full resolution | `0.5` |
 
-For long recordings, the front end stores compact numeric observations instead of one NumPy array per point per frame, retires dead KLT tracks, and caps DLT systems. The five frontend/solver values above now match the corresponding Specialist defaults. They are heavier than the previous runtime-tuned values (`220 / 5 / 90 / 24 / 8`), so expect longer frontend and optimizer times. Full-resolution AprilTag detection is the largest per-frame cost, so detection runs on a half-resolution image and refines the returned corners against the full-resolution frame. Increasing `tag_detect_stride` further speeds up detection but makes the anchor-based initialization too sparse and can destabilize the batch optimization.
+For long recordings, the front end stores compact numeric observations instead of one NumPy array per point per frame, retires dead KLT tracks, and caps DLT systems. The current values (`220 / 5 / 300 / 8`) are runtime-tuned rather than the heavier Specialist defaults. Full-resolution AprilTag detection is the largest per-frame cost, so detection runs on a half-resolution image and refines the returned corners against the full-resolution frame. Increasing `tag_detect_stride` further speeds up detection but makes the anchor-based initialization too sparse and can destabilize the batch optimization.
 
 ### Optimizer parameters
 
@@ -402,11 +399,11 @@ For long recordings, the front end stores compact numeric observations instead o
 | `anchor_factor_stride` | Add anchor gauge factors only every N-th optimized frame | `4` |
 | `max_klt_obs_per_landmark` | Maximum KLT observations per landmark in the batch graph | `30` |
 | `backend_frame_stride` | Optimize every N-th camera frame and interpolate the full-rate output | `2` |
-| `anchor_sigma_px` | Anchor corner reprojection noise sigma | `1.05` |
-| `klt_sigma_px` | KLT reprojection noise sigma | `0.5` |
-| `anchor_huber_px` | Huber threshold for anchor residuals | `1.41` |
-| `klt_huber_px` | Huber threshold for KLT residuals | `0.67` |
-| `klt_omega_rate_scale` | Downweight fast-rotation KLT observations by `1 + scale*||omega||` | `0.0` |
+| `anchor_sigma_px` | Anchor corner reprojection noise sigma | `0.05` |
+| `klt_sigma_px` | KLT reprojection noise sigma | `0.45` |
+| `anchor_huber_px` | Huber threshold for anchor residuals | `5.0` |
+| `klt_huber_px` | Huber threshold for KLT residuals | `2.0` |
+| `klt_omega_rate_scale` | Downweight fast-rotation KLT observations by `1 + scale*||omega||` | `0.15` |
 | `rolling_shutter_readout_s` | Full-frame readout in seconds; `null` uses `.insv` metadata, `0` disables | `null` |
 | `estimate_time_offset` | Estimate camera-minus-IMU time offset as an optimizer variable | `false` |
 | `time_offset_prior_s` | Prior sigma (seconds) on that time offset | `0.005` |
@@ -419,8 +416,8 @@ The full batch graph uses one Python `CustomFactor` per visual observation, so f
 
 The AprilTag pose can have two planar-PnP branches. The frontend keeps only branches whose reprojection error is within 3 px of the best branch, then applies continuity. Anchor corner noise and weighting affect how strongly the optimizer follows the initialized branch versus smoothing observations:
 
-- `anchor_sigma_px: 1.05` (default) — stronger tag pull; overfitting can couple tag jitter into translation
-- `anchor_sigma_px: 0.5` — looser constraint; smoother but less influenced by the anchor
+- `anchor_sigma_px: 0.05` (default) — very strong tag pull; useful only when corner refinement is accurate
+- `anchor_sigma_px: 1.05` — Specialist-style weighting; smoother but less influenced by the anchor
 - `init_prior_rot` / `init_prior_trans` — optional priors to keep poses near the continuity-selected PnP initialization
 
 ### Command-line overrides
@@ -428,7 +425,7 @@ The AprilTag pose can have two planar-PnP branches. The frontend keeps only bran
 Any value from `config/vio.yaml` can be overridden on the command line:
 
 ```bash
-pixi run python trajectory.py \
+uv run python trajectory.py \
   --rrd logs/base/60Hz.rrd \
   --anchor-sigma 0.30 \
   --min-parallax-deg 0.15 \
@@ -443,7 +440,7 @@ pixi run python trajectory.py \
 Use a different YAML file:
 
 ```bash
-pixi run python trajectory.py \
+uv run python trajectory.py \
   --rrd logs/base/60Hz.rrd \
   --vio-config path/to/other.yaml
 ```
@@ -451,7 +448,7 @@ pixi run python trajectory.py \
 Set custom output paths:
 
 ```bash
-pixi run python trajectory.py \
+uv run python trajectory.py \
   --rrd logs/base/60Hz.rrd \
   --out-npz logs/estimate/custom.npz \
   --viz logs/estimate/custom.rrd
@@ -536,6 +533,33 @@ data = np.load("logs/estimate/60Hz_trajectory.npz")
 poses = data["T_world_cam1"]
 positions = poses[:, :3, 3]
 ```
+
+## Evaluating against ground truth
+
+`ATE.py` compares a saved TCP trajectory with a TUM-format ground-truth file:
+
+```bash
+uv run python ATE.py
+uv run python ATE.py --est logs/estimate/VID_20261117_145759_00_025_tcp_trajectory.npz
+```
+
+The supplied base recording and `groundtruth/traj_tum.txt` do not share the same
+time origin. For that pair, evaluate with a camera-to-ground-truth offset of
+`-5.5 s`:
+
+```bash
+uv run python ATE.py --time-offset -5.5
+```
+
+`trajectory.py` writes TCP timestamps with `output.time_origin_offset_s` applied
+(default `0.0`; override with `--time-origin-offset`). This normalizes the
+exported time origin so that the documented `-5.5 s` offset remains the correct
+one even when the best trajectory shape aligns at a slightly different raw
+timestamp offset.
+
+Translation uses Umeyama alignment. Rotation uses a separate orientation-only
+Procrustes fit, because a VIO world frame has an arbitrary gauge and the
+position-alignment rotation is not generally the orientation-alignment rotation.
 
 ## Front-end only
 
